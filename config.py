@@ -320,7 +320,9 @@ class SettingsDialog(QDialog):
             "Ask before pasting more than one line")
         self.warn_paste.setChecked(bool(self.cfg.get("warn_multiline_paste", True)))
         self.warn_paste.setToolTip(
-            "Each line break in pasted text runs a command immediately.")
+            "Only applies when the shell lacks bracketed paste (cmd.exe, "
+            "PowerShell): the lines then run one by one as each finishes. "
+            "bash/zsh over SSH take the block whole and wait for Enter.")
 
         tform.addRow("Shell", self.shell)
         tform.addRow("Font", self.font_family)

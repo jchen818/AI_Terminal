@@ -179,6 +179,15 @@ class TerminalWidget(QWidget):
         self._capture_deadline.setSingleShot(True)
         self._capture_deadline.timeout.connect(
             lambda: self._finish_capture("timeout"))
+        # Multi-line paste into a shell without bracketed paste: lines are
+        # typed one at a time, each once the previous one is back at a
+        # prompt. See paste().
+        self._paste_queue = []
+        self._paste_prompt = ""
+        self._paste_seen_output = False
+        self._paste_timer = QTimer(self)
+        self._paste_timer.setSingleShot(True)
+        self._paste_timer.timeout.connect(self._paste_next)
         self.scrollbar = QScrollBar(Qt.Vertical, self)
         self.scrollbar.setFocusPolicy(Qt.NoFocus)
         self.scrollbar.setCursor(Qt.ArrowCursor)
@@ -323,7 +332,12 @@ class TerminalWidget(QWidget):
             return
         if capture:
             self._begin_capture(text)
-        self.send(text.replace("\n", "\r") + "\r")
+        if "\n" in text and self._bracketed_paste():
+            # One edit-line unit: a long-running first line can't leave the
+            # rest stranded as tty type-ahead (see paste()).
+            self.send(self._bracket(text) + "\r")
+        else:
+            self.send(text.replace("\n", "\r") + "\r")
         self.setFocus()
 
     # -------------------------------------------------------- capture
@@ -446,8 +460,12 @@ class TerminalWidget(QWidget):
             self._capture_buf.append(text)
             self._last_data = time.monotonic()
             self._idle_timer.start(int(self.cfg.get("capture_idle_ms", 900)))
+        if self._paste_queue:
+            self._paste_seen_output = True
         before = self._max_offset()
         self.stream.feed(text)
+        if self._paste_queue:
+            self._paste_timer.start(self.PASTE_IDLE_MS)
         grown = self._max_offset() - before
         # Scrolled back? Stay on the same content while output rolls past.
         if self.scroll_offset and grown > 0:
@@ -670,6 +688,7 @@ class TerminalWidget(QWidget):
             self.cancel_capture()
             self.notice.emit("You took over — the assistant stopped watching "
                              "this command")
+        self._cancel_paste_queue()
 
         # Typing snaps back to the live prompt.
         if self.scroll_offset:
@@ -677,25 +696,119 @@ class TerminalWidget(QWidget):
         self.send(payload)
 
     def paste(self):
+        """Paste the clipboard into the shell.
+
+        The old way sent every line in one raw burst. That breaks as soon
+        as a line keeps running (a wait loop, a restart, a download): the
+        lines after it land in the tty as type-ahead, get echoed half-drawn
+        over the running command's output, and a Ctrl+C throws them away
+        unrun.
+
+        Now, like Windows Terminal and xterm:
+        * If the shell has turned bracketed paste on (bash/readline, zsh and
+          fish do, over SSH too), the text is wrapped in ESC[200~ ... ESC[201~.
+          The shell takes the whole block into its edit line as one unit and
+          runs nothing until Enter, so there is nothing to confirm.
+        * Otherwise (cmd.exe, PowerShell, old shells) the lines are queued,
+          and each is typed only after the previous one is back at a prompt.
+          Typing anything stops the rest.
+        """
         text = QGuiApplication.clipboard().text()
         if not text:
             self.notice.emit("Clipboard is empty")
             return
-        lines = [ln for ln in text.strip().splitlines() if ln.strip()]
-        if len(lines) > 1 and self.cfg.get("warn_multiline_paste", True):
-            preview = "\n".join(lines[:6])
-            if len(lines) > 6:
-                preview += f"\n… and {len(lines) - 6} more"
+        self._cancel_paste_queue(quiet=True)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        self._scroll_to_bottom()
+
+        if self._bracketed_paste():
+            body = text.rstrip("\n")
+            self.send(self._bracket(body))
+            n = len([ln for ln in body.split("\n") if ln.strip()])
+            self.notice.emit(f"Pasted {n} lines — press Enter to run them"
+                             if n > 1 else "Pasted")
+            return
+
+        lines = text.strip("\n").split("\n")
+        real = [ln for ln in lines if ln.strip()]
+        if len(lines) == 1:
+            # One line keeps the clipboard's trailing newline, or lack of one.
+            self.send(text.replace("\n", "\r"))
+            self.notice.emit("Pasted")
+            return
+        if len(real) > 1 and self.cfg.get("warn_multiline_paste", True):
+            preview = "\n".join(real[:6])
+            if len(real) > 6:
+                preview += f"\n… and {len(real) - 6} more"
             confirm = QMessageBox.question(
                 self, "Paste multiple lines?",
-                f"This pastes {len(lines)} lines. Every line break runs a "
-                f"command straight away.\n\n{preview}",
+                f"This runs {len(real)} lines, each one after the previous "
+                f"one is back at the prompt. Typing anything stops the rest."
+                f"\n\n{preview}",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if confirm != QMessageBox.Yes:
                 return
-        self._scroll_to_bottom()
-        self.send(text.replace("\r\n", "\r").replace("\n", "\r"))
-        self.notice.emit("Pasted")
+        # The prompt on screen now is what "finished" looks like.
+        self._paste_prompt = self._cursor_line().strip()
+        self._paste_queue = lines[1:]
+        self._paste_seen_output = False
+        self.send(lines[0] + "\r")
+        self._paste_timer.start(self.PASTE_IDLE_MS)
+        self.notice.emit(f"Pasting {len(real)} lines…")
+
+    PASTE_IDLE_MS = 250
+
+    def _bracketed_paste(self) -> bool:
+        """True while the program in the terminal has set DECSET 2004."""
+        return self.screen is not None and (2004 << 5) in self.screen.mode
+
+    @staticmethod
+    def _bracket(text: str) -> str:
+        # Strip any end marker inside the text, or a paste could smuggle
+        # keystrokes out past the bracket and have them run.
+        body = text.replace("\x1b[201~", "").replace("\n", "\r")
+        return "\x1b[200~" + body + "\x1b[201~"
+
+    def _paste_ready(self) -> bool:
+        """Is the shell back at a prompt, ready for the next pasted line?"""
+        line = self._cursor_line().strip()
+        if not line:
+            return False
+        # A password or y/n question is never a prompt: the next pasted line
+        # must not be typed into one.
+        if WAITING_RE.search(line):
+            return False
+        return (line == self._paste_prompt
+                or bool(PROMPT_RE.search(line))
+                or line == ">")             # continuation (PS2): heredoc, if…fi
+
+    def _paste_next(self):
+        if not self._paste_queue or self.proc is None:
+            self._paste_queue = []
+            return
+        # Until output arrives, the old prompt is still under the cursor and
+        # would look "ready" — wait for the echo at least.
+        if not self._paste_seen_output or not self._paste_ready():
+            # Still running. New output restarts the timer; this re-check
+            # covers commands that sit silent (sleep, wait loops).
+            self._paste_timer.start(self.PASTE_IDLE_MS * 4)
+            return
+        line = self._paste_queue.pop(0)
+        self._paste_seen_output = False
+        self.send(line + "\r")
+        if self._paste_queue:
+            self._paste_timer.start(self.PASTE_IDLE_MS)
+        else:
+            self.notice.emit("Paste finished")
+
+    def _cancel_paste_queue(self, quiet: bool = False):
+        if not self._paste_queue:
+            return
+        left = len([ln for ln in self._paste_queue if ln.strip()])
+        self._paste_queue = []
+        self._paste_timer.stop()
+        if not quiet and left:
+            self.notice.emit(f"Paste stopped — {left} line(s) not sent")
 
     # ------------------------------------------------------------ scroll
 

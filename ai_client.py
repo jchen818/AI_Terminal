@@ -55,7 +55,12 @@ def _payload(cfg: dict, messages: list, stream: bool) -> dict:
             "model": cfg.get("model", ""),
             "messages": msgs,
             "stream": stream,
-            "options": {"temperature": float(cfg.get("temperature", 0.7))},
+            "options": {
+                "temperature": float(cfg.get("temperature", 0.7)),
+                # Ollama otherwise generates without limit, so a model stuck
+                # in a loop never ends. Generous, since thinking counts too.
+                "num_predict": max(8192, 4 * int(cfg.get("max_tokens", 2048))),
+            },
         }
     return {
         "model": cfg.get("model", ""),
@@ -83,6 +88,7 @@ class ChatWorker(QThread):
     """Runs one request. Emits text as it arrives."""
 
     chunk = Signal(str)
+    thinking = Signal(str)   # reasoning text, from models that stream it
     finished_ok = Signal()
     failed = Signal(str)
 
@@ -127,7 +133,11 @@ class ChatWorker(QThread):
             return
 
         if not stream:
-            self.chunk.emit(_extract_full(self.cfg, resp.json()))
+            obj = resp.json()
+            thought = _extract_thinking(self.cfg, obj)
+            if thought:
+                self.thinking.emit(thought)
+            self.chunk.emit(_extract_full(self.cfg, obj))
             self.finished_ok.emit()
             return
 
@@ -141,7 +151,9 @@ class ChatWorker(QThread):
             line = raw.strip()
 
             if style == "ollama":
-                text = _ollama_delta(line)
+                text, thought = _ollama_delta(line)
+                if thought:
+                    self.thinking.emit(thought)
                 if text:
                     self.chunk.emit(text)
                 continue
@@ -155,8 +167,10 @@ class ChatWorker(QThread):
                 obj = json.loads(data)
             except ValueError:
                 continue
-            text = (_anthropic_delta(obj) if style == "anthropic"
-                    else _openai_delta(obj))
+            text, thought = (_anthropic_delta(obj) if style == "anthropic"
+                             else _openai_delta(obj))
+            if thought:
+                self.thinking.emit(thought)
             if text:
                 self.chunk.emit(text)
 
@@ -165,32 +179,61 @@ class ChatWorker(QThread):
 
 # ---------------------------------------------------------------- parsers
 
-def _openai_delta(obj) -> str:
+# Each parser returns (answer_text, thinking_text). Reasoning models stream
+# their thinking on a separate field; ignoring it left the reply blank for
+# minutes while the model was busy thinking.
+
+def _openai_delta(obj):
     try:
-        return obj["choices"][0]["delta"].get("content") or ""
+        delta = obj["choices"][0]["delta"]
     except (KeyError, IndexError, TypeError):
-        return ""
+        return "", ""
+    # reasoning_content: DeepSeek, vLLM, LM Studio. reasoning: OpenRouter,
+    # Groq, Ollama's OpenAI endpoint.
+    thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    if not isinstance(thought, str):
+        thought = ""
+    return delta.get("content") or "", thought
 
 
-def _anthropic_delta(obj) -> str:
+def _anthropic_delta(obj):
     if obj.get("type") == "content_block_delta":
-        return obj.get("delta", {}).get("text", "") or ""
-    return ""
+        delta = obj.get("delta", {})
+        if delta.get("type") == "thinking_delta":
+            return "", delta.get("thinking", "") or ""
+        return delta.get("text", "") or "", ""
+    return "", ""
 
 
-def _ollama_delta(line: str) -> str:
+def _ollama_delta(line: str):
     try:
         obj = json.loads(line)
     except ValueError:
+        return "", ""
+    msg = obj.get("message", {})
+    return msg.get("content", "") or "", msg.get("thinking", "") or ""
+
+
+def _extract_thinking(cfg: dict, obj) -> str:
+    style = cfg.get("api_style", "openai")
+    try:
+        if style == "anthropic":
+            return "".join(b.get("thinking", "") for b in obj.get("content", [])
+                           if b.get("type") == "thinking")
+        if style == "ollama":
+            return obj.get("message", {}).get("thinking", "") or ""
+        msg = obj["choices"][0]["message"]
+        return msg.get("reasoning_content") or msg.get("reasoning") or ""
+    except (KeyError, IndexError, TypeError, AttributeError):
         return ""
-    return obj.get("message", {}).get("content", "") or ""
 
 
 def _extract_full(cfg: dict, obj) -> str:
     style = cfg.get("api_style", "openai")
     try:
         if style == "anthropic":
-            return "".join(b.get("text", "") for b in obj.get("content", []))
+            return "".join(b.get("text", "") for b in obj.get("content", [])
+                           if b.get("type", "text") == "text")
         if style == "ollama":
             return obj.get("message", {}).get("content", "")
         return obj["choices"][0]["message"]["content"]

@@ -1,6 +1,7 @@
 """The right-hand pane: conversation, composer, and the bridge to the shell."""
 
 import re
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QGuiApplication, QKeySequence, QShortcut
@@ -45,6 +46,144 @@ DESTRUCTIVE = [re.compile(p, re.I) for p in (
     r"\bgit\s+(reset\s+--hard|clean\s+-\S*f)",
     r"\b:>\s*/",
 )]
+
+
+# Sent with every request while auto-run is armed, so the model works the
+# way the loop does: one command, look at the result, then the next.
+AGENT_RULES = (
+    "[Auto-run is on: your commands run in the terminal automatically and I "
+    "send you each command's output.]\n"
+    "Work one step at a time. Reply with a short note on what you are doing "
+    "and exactly ONE fenced code block holding exactly one command (or one "
+    "script that must run as a unit). Never list several commands to run in "
+    "sequence; choose the next one only after you have seen the previous "
+    "output. Do not use commands that wait for input (pagers, editors, "
+    "interactive prompts); prefer non-interactive flags such as -y, "
+    "--no-pager, | cat. When output may be long, filter it (grep, head, "
+    "tail, a specific subcommand or field) rather than dumping everything. "
+    "Never guess at options: if a command fails because of "
+    "a bad option or unknown command, check its --help once, then use only "
+    "options you saw there. If the same thing fails twice, stop trying "
+    "variants. When the task is finished, or you cannot continue "
+    "without me, reply starting with DONE and a short summary, and give no "
+    "code block.")
+
+DONE_RE = re.compile(r"^\W*DONE\b", re.M)
+
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+
+
+def split_thinking(text: str):
+    """Pull <think>…</think> reasoning out of a reply. Returns (thinking, answer).
+
+    Some servers put a reasoning model's thinking inline in the content
+    instead of a separate field. Commands inside it are the model musing, not
+    instructions, so they must never reach the run list. Handles an unclosed
+    tag (still thinking) and a missing opening tag (some R1 templates).
+    """
+    thoughts, answer, rest = [], [], text
+    if THINK_CLOSE in rest and THINK_OPEN not in rest.split(THINK_CLOSE, 1)[0]:
+        before, rest = rest.split(THINK_CLOSE, 1)
+        thoughts.append(before)
+    while THINK_OPEN in rest:
+        before, after = rest.split(THINK_OPEN, 1)
+        answer.append(before)
+        if THINK_CLOSE in after:
+            inner, rest = after.split(THINK_CLOSE, 1)
+            thoughts.append(inner)
+        else:
+            thoughts.append(after)
+            rest = ""
+    answer.append(rest)
+    return "\n".join(t.strip() for t in thoughts if t.strip()), "".join(answer).strip()
+
+
+# Output lines that mean the command itself was wrong, not just that it
+# reported a problem on the machine.
+FAIL_RE = re.compile(
+    r"(unrecognized option|invalid option|unknown option|illegal option|"
+    r"unrecognized arguments|invalid choice|command not found|"
+    r"is not recognized as an internal|no such file or directory|"
+    r"permission denied|^\s*usage:|^\s*error:|^E: )", re.I | re.M)
+
+
+def looks_failed(output: str) -> bool:
+    return bool(FAIL_RE.search(output or ""))
+
+
+def normalise_cmd(cmd: str) -> str:
+    return " ".join(cmd.split()).lower()
+
+
+def is_repeating(text: str) -> bool:
+    """True when a stream has fallen into a loop of the same few words.
+
+    Models sometimes degenerate and emit one fragment ("--showxgbe… --")
+    until they hit the token limit, which can take minutes and may yield a
+    garbage command. Looks at the tail for one unit of 3-150 characters
+    repeated back to back, covering at least 300 characters.
+    """
+    tail = " ".join(text[-1500:].split())
+    if len(tail) < 300:
+        return False
+    for n in range(3, 151):
+        unit = tail[-n:]
+        if not unit.strip():
+            continue
+        count, end = 0, len(tail)
+        while end - n >= 0 and tail[end - n:end] == unit:
+            count += 1
+            end -= n
+        if count >= 8 and count * n >= 300:
+            return True
+    return False
+
+
+def fit_output(text: str, budget: int):
+    """Fit terminal output into budget characters, cutting whole lines.
+
+    Keeps the start (headers, first errors) and a larger end (final state,
+    summary). Returns (text, note): note tells the model exactly which lines
+    it is not seeing, or is "" when nothing was cut.
+    """
+    if len(text) <= budget:
+        return text, ""
+    lines = text.split("\n")
+    head_budget, tail_budget = int(budget * 0.35), int(budget * 0.65)
+    head, used = [], 0
+    for ln in lines:
+        if used + len(ln) + 1 > head_budget:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail, used = [], 0
+    for ln in reversed(lines[len(head):]):
+        if used + len(ln) + 1 > tail_budget:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    tail.reverse()
+    if not head and not tail:          # one enormous line
+        return (text[:head_budget] + "\n…\n" + text[-tail_budget:],
+                f"(A single line of {len(text):,} characters was cut in the "
+                "middle.)")
+    first, last = len(head) + 1, len(lines) - len(tail)
+    marker = f"… lines {first:,}–{last:,} not shown …"
+    note = (f"(The output was {len(lines):,} lines / {len(text):,} characters "
+            f"and lines {first:,}–{last:,} are not shown. If you need them, run "
+            "a narrower command instead of repeating this one: filter with "
+            "grep for the fields you need, or save the output to a file once "
+            f"and read a range, e.g. `sed -n '{first},{min(last, first + 199)}p'`.)")
+    return "\n".join(head + [marker] + tail), note
+
+
+def clip(text: str, limit: int) -> str:
+    """Keep the head and tail of long output; the middle is usually repetition."""
+    if len(text) <= limit:
+        return text
+    half = max(1, limit // 2)
+    return (f"{text[:half]}\n… {len(text) - 2 * half} characters omitted …\n"
+            f"{text[-half:]}")
 
 
 def is_destructive(block: str) -> bool:
@@ -212,9 +351,11 @@ class ChatPanel(QWidget):
         self.auto_run = QCheckBox("Auto-run")
         self.auto_run.setVisible(False)
         self.auto_run.setToolTip(
-            "Run the first code block of each reply without asking.\n"
-            "You get a few seconds to cancel, and anything destructive still "
-            "prompts. Resets when the app restarts.")
+            "Let the assistant work through the task step by step: it runs one "
+            "command, reads the output, then decides the next.\n"
+            "You get a few seconds to cancel each step, anything destructive "
+            "still prompts, and typing in the terminal takes over. Resets when "
+            "the app restarts.")
         self.auto_run.toggled.connect(self._auto_run_toggled)
         code_row = QHBoxLayout()
         code_row.addWidget(self.code_picker, 1)
@@ -276,6 +417,15 @@ class ChatPanel(QWidget):
         self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self._render)
 
+        # Ticks the "waiting / thinking for N s" line while a reply is pending.
+        self._wait_timer = QTimer(self)
+        self._wait_timer.timeout.connect(self._render)
+        self._req_started = 0.0
+        self._answer_started = 0.0
+        self._chain_log = []    # auto-run this chain: (command, failed)
+        self._thinking = {}     # display index -> reasoning streamed separately
+        self._think_secs = {}   # display index -> seconds spent thinking
+
         self.refresh_config(cfg)
         self.new_chat()
 
@@ -302,6 +452,8 @@ class ChatPanel(QWidget):
         self._auto_chain = 0
         self.messages = []
         self._display_list = []
+        self._thinking = {}
+        self._think_secs = {}
         self.code_picker.clear()
         self.code_picker.setVisible(False)
         self.run_btn.setVisible(False)
@@ -334,12 +486,21 @@ class ChatPanel(QWidget):
         if self.include_output.isChecked():
             screen = self.terminal.capture_since_last() if self.terminal else ""
             if screen:
+                full = len(screen)
+                screen, cut = fit_output(screen, self.output_budget)
                 payload = (f"{text}\n\nHere is the terminal output since it was "
-                           f"last attached:\n```\n{screen}\n```")
-                display = f"{text}\n\n*(terminal output attached)*"
+                           f"last attached:\n```\n{screen}\n```"
+                           f"{chr(10) * 2 + cut if cut else ''}")
+                display = (f"{text}\n\n*(terminal output attached — "
+                           f"{self._size_note(full, len(screen) if cut else full)})*")
+
+        if self.auto_run.isChecked():
+            payload = f"{payload}\n\n{AGENT_RULES}"
+            display += "\n\n*(auto-run: step by step)*"
 
         self.input.clear()
         self._auto_chain = 0          # a typed message starts a fresh chain
+        self._chain_log = []
         self._dispatch(payload, display)
 
     def stop(self):
@@ -348,24 +509,87 @@ class ChatPanel(QWidget):
             self.worker.wait(1500)
             self.worker = None
         self.streaming = False
+        self._wait_timer.stop()
         self.send_btn.setVisible(True)
         self.stop_btn.setVisible(False)
 
     def _on_chunk(self, text: str):
+        if not self.streaming:
+            return
         role, current = self._display[-1]
         self._display[-1] = (role, current + text)
+        if is_repeating(current + text):
+            self._abort_runaway()
+            return
+        if not self._answer_started and split_thinking(current + text)[1]:
+            self._answer_started = time.monotonic()
         if not self.render_timer.isActive():
             self.render_timer.start(90)
 
+    def _on_thinking(self, text: str):
+        if not self.streaming:
+            return
+        i = len(self._display) - 1
+        self._thinking[i] = self._thinking.get(i, "") + text
+        if is_repeating(self._thinking[i]):
+            self._abort_runaway()
+            return
+        if not self.render_timer.isActive():
+            self.render_timer.start(90)
+
+    def _abort_runaway(self):
+        """Cut off a reply that is looping, and hand control back."""
+        worker = self.worker
+        if worker is not None:
+            for sig in (worker.chunk, worker.thinking,
+                        worker.finished_ok, worker.failed):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        i = len(self._display) - 1
+        role, raw = self._display[-1]
+        _, answer = split_thinking(raw)
+        keep = answer[:600] + ("…" if len(answer) > 600 else "")
+        if self._thinking.get(i, "") and len(self._thinking[i]) > 1500:
+            self._thinking[i] = self._thinking[i][:1500] + " …"
+        self._display[-1] = (role, (keep + "\n\n" if keep else "") +
+                             "**Stopped — the model started repeating itself.** "
+                             "Nothing from this reply was run.")
+        # Keep the history consistent so the next message still makes sense.
+        self.messages.append({"role": "assistant", "content":
+                              "(My previous reply broke down into repeated text "
+                              "and was cut off.)"})
+        self.stop()
+        self._clear_blocks()
+        if self.auto_run.isChecked():
+            self.auto_run.setChecked(False)
+        self.notice.emit("Reply cut off — the model was looping. Auto-run paused")
+        self._render()
+
     def _on_done(self):
-        role, content = self._display[-1]
+        role, raw = self._display[-1]
+        i = len(self._display) - 1
+        if self._req_started and (self._thinking.get(i) or
+                                  split_thinking(raw)[0]):
+            end = self._answer_started or time.monotonic()
+            self._think_secs[i] = end - self._req_started
+        # Only the answer counts. Thinking is neither sent back to the model
+        # nor searched for commands to run.
+        content = split_thinking(raw)[1]
         if not content.strip():
-            self._display[-1] = (role, "*(empty response)*")
+            self._display[-1] = (role, raw if raw.strip() else "*(empty response)*")
         else:
             self.messages.append({"role": "assistant", "content": content})
+        self.streaming = False
         self._render()
         self._collect_code_blocks(content)
         self.stop()
+        if (self.auto_run.isChecked() and self._auto_chain
+                and DONE_RE.search(content) and self.code_picker.count() == 0):
+            self.notice.emit(f"Auto-run finished after {self._auto_chain} step"
+                             f"{'s' if self._auto_chain != 1 else ''}")
+            self._auto_chain = 0
         self._maybe_auto_run()
         self.input.setFocus()
 
@@ -385,11 +609,42 @@ class ChatPanel(QWidget):
             self._display_list = []
         return self._display_list
 
+    THINK_SHOWN = 4000   # characters of reasoning kept on screen
+
+    def _assistant_block(self, i: int, raw: str) -> str:
+        inline, answer = split_thinking(raw)
+        thought = "\n".join(t for t in (self._thinking.get(i, ""), inline) if t)
+        live = self.streaming and i == len(self._display) - 1
+        now = time.monotonic()
+        out = []
+        if thought:
+            if live and not answer:
+                head = f"*Thinking… {now - self._req_started:.0f} s*"
+            else:
+                secs = self._think_secs.get(i)
+                head = f"*Thought for {secs:.0f} s*" if secs else "*Thinking*"
+            shown = thought.strip()
+            if len(shown) > self.THINK_SHOWN:
+                shown = "…" + shown[-self.THINK_SHOWN:]
+            quoted = "\n".join("> " + ln if ln.strip() else ">"
+                               for ln in shown.splitlines())
+            out.append(f"{head}\n\n{quoted}")
+        if answer:
+            out.append(answer)
+        elif live and not thought:
+            out.append(f"*Waiting for the model… "
+                       f"{now - self._req_started:.0f} s*")
+        elif not live and not thought:
+            out.append(raw or "…")
+        return "\n\n".join(out)
+
     def _render(self, follow: bool = None):
         parts = []
-        for role, content in self._display:
-            who = "You" if role == "user" else "Assistant"
-            parts.append(f"**{who}**\n\n{content or '…'}")
+        for i, (role, content) in enumerate(self._display):
+            if role == "user":
+                parts.append(f"**You**\n\n{content or '…'}")
+            else:
+                parts.append(f"**Assistant**\n\n{self._assistant_block(i, content)}")
 
         bar = self.view.verticalScrollBar()
         # Follow the stream only while the reader is already at the bottom.
@@ -455,13 +710,14 @@ class ChatPanel(QWidget):
         self.auto_run.setVisible(found or self.auto_run.isChecked())
         self.check_results.setVisible(found or self.auto_run.isChecked())
 
-        # Auto-run takes the first entry only. Say so rather than quietly
-        # dropping the rest — the others stay selectable in the dropdown.
+        # Auto-run takes the first entry only; the rest are the model planning
+        # ahead without having seen any output, so they are not run. It will
+        # be asked for the next step once it has read this one's result.
         extra = self.code_picker.count() - 1
         if extra > 0 and self.auto_run.isChecked():
             self.notice.emit(
-                f"Running the first of {self.code_picker.count()} commands — "
-                f"{extra} more in the dropdown")
+                f"Running step 1 of {self.code_picker.count()} suggested — the "
+                f"next step is chosen after reading its output")
 
     # ---------------------------------------------------------- auto-run
 
@@ -469,24 +725,57 @@ class ChatPanel(QWidget):
 
     def _auto_run_toggled(self, on: bool):
         if on:
+            # Auto-run without reading results is just running a list blind.
+            # The loop only works if every output goes back to the model.
+            self.check_results.setChecked(True)
+            self.check_results.setEnabled(False)
             self.run_btn.setStyleSheet(
                 "QPushButton{background:#5a4412;border-color:#8a6a1f;}")
-            self.notice.emit("Auto-run armed — replies will run without asking")
+            self.notice.emit("Auto-run armed — one command at a time, each "
+                             "result read before the next")
+            self._auto_chain = 0
+            self._chain_log = []
+            # Commands already on offer from the last reply: start with the
+            # first of them now instead of waiting for another reply.
+            if not self.streaming:
+                self._maybe_auto_run()
         else:
+            self.check_results.setEnabled(True)
             self.run_btn.setStyleSheet("")
             self._cancel_auto_run()
+
+    @property
+    def output_budget(self) -> int:
+        return max(2000, int(self.cfg.get("ai_output_chars", 24000)))
+
+    @staticmethod
+    def _size_note(full: int, sent: int) -> str:
+        if sent >= full:
+            return f"all {full:,} characters sent to the assistant"
+        return (f"{sent:,} of {full:,} characters sent to the assistant; the "
+                f"middle was left out and it was told which lines")
+
+    @property
+    def max_steps(self) -> int:
+        return max(1, int(self.cfg.get("auto_run_max_steps", 20)))
 
     def _maybe_auto_run(self):
         """Called once a reply is complete."""
         if not self.auto_run.isChecked() or self.code_picker.count() == 0:
             return
+        if self._auto_timer.isActive():
+            return
         if self.terminal is None or self.terminal.proc is None:
             self.notice.emit("Auto-run skipped — no shell session")
             return
+        if getattr(self.terminal, "busy", False):
+            self.notice.emit("Auto-run waiting — the last command is still running")
+            return
 
-        if self._auto_chain >= self.MAX_CHAIN:
+        if self._auto_chain >= self.max_steps:
             self.notice.emit(
-                f"Auto-run paused after {self.MAX_CHAIN} rounds — press Run to continue")
+                f"Auto-run paused after {self.max_steps} steps — press Run to "
+                f"continue, or send a message")
             return
 
         self.code_picker.setCurrentIndex(0)
@@ -514,9 +803,12 @@ class ChatPanel(QWidget):
             self.run_btn.setText("Run in terminal")
             data = self.code_picker.currentData() or {}
             block = data.get("text", "")
+            if block and getattr(self.terminal, "busy", False):
+                self.notice.emit("Auto-run held — the terminal is still busy")
+                return
             if block:
                 self._auto_chain += 1
-                self.notice.emit(f"Auto-running (round {self._auto_chain})")
+                self.notice.emit(f"Auto-run step {self._auto_chain}/{self.max_steps}")
                 self._emit_run(block)
             return
         self._auto_tick_label()
@@ -532,8 +824,6 @@ class ChatPanel(QWidget):
         self._countdown = 0
         self.run_btn.setText("Run in terminal")
 
-    MAX_CHAIN = 6   # automatic run→check rounds before handing back control
-
     def _advance_picker(self):
         """Step to the next command so repeated Run clicks walk the list."""
         i = self.code_picker.currentIndex()
@@ -542,11 +832,17 @@ class ChatPanel(QWidget):
 
     def _emit_run(self, block: str):
         self._last_run = block
-        self.run_in_terminal.emit(block, self.check_results.isChecked())
+        # Blocks belong to the reply that offered them. Once one runs, the
+        # rest are stale until the model has seen this output.
+        if self.auto_run.isChecked():
+            self._clear_blocks()
+        self.run_in_terminal.emit(
+            block, self.check_results.isChecked() or self.auto_run.isChecked())
 
     def on_command_output(self, command: str, output: str, status: str):
         """The terminal finished a command we started. Send the result back."""
-        if not self.check_results.isChecked():
+        auto = self.auto_run.isChecked()
+        if not (self.check_results.isChecked() or auto):
             return
         if self.streaming:
             self.notice.emit("Command finished while a reply was in flight")
@@ -558,22 +854,75 @@ class ChatPanel(QWidget):
             self.auto_run.setChecked(False)
             return
 
-        note = ("\n\n(The command was still running after the timeout; this is "
-                "partial output.)" if status == "timeout" else "")
+        note = ""
+        if status in ("timeout", "stalled"):
+            note = ("\n\n(The command had not returned to the prompt when this "
+                    "was captured, so it may still be running and the output may "
+                    "be partial.)")
+            if auto:
+                # Typing the next command now would feed it to the running one.
+                self.auto_run.setChecked(False)
+                self.notice.emit("Command did not finish — auto-run paused; "
+                                 "check the terminal, then re-arm")
+                auto = False
 
+        warn = ""
+        if auto:
+            failed = looks_failed(output)
+            key = normalise_cmd(command)
+            repeat = any(k == key for k, _ in self._chain_log)
+            self._chain_log.append((key, failed))
+            streak = 0
+            for _, f in reversed(self._chain_log):
+                if not f:
+                    break
+                streak += 1
+            if failed and (repeat or streak >= 3):
+                # Retrying the same thing, or guessing variant after variant:
+                # more steps will not help. Let the model explain, but stop.
+                why = ("the same command failed again" if repeat
+                       else f"{streak} commands in a row failed")
+                self.auto_run.setChecked(False)
+                self.notice.emit(f"Auto-run paused — {why}")
+                auto = False
+                warn = (f"\n\nAuto-run has been stopped because {why}. Do not "
+                        "suggest another variant. Explain briefly what is going "
+                        "wrong and what you need from me.")
+
+        step = (f"Step {self._auto_chain} of at most {self.max_steps}. "
+                if auto else "")
+        full_output = output or ""
+        output, cut = fit_output(full_output, self.output_budget)
+        if cut:
+            note = f"\n\n{cut}{note}"
+        head = f"I ran this in the terminal:\n```\n{command}\n```\n\n"
+        # What this turn shrinks to once newer results have arrived. Old
+        # outputs have already been acted on; re-sending them in full on every
+        # step made each request bigger and slower than the last.
+        short = (f"{head}Output (shortened, already handled):\n```\n"
+                 f"{clip(output or '(no output)', 800)}\n```")
         payload = (
-            f"I ran this in the terminal:\n```\n{command}\n```\n\n"
-            f"Output:\n```\n{output or '(no output)'}\n```{note}\n\n"
-            "Check the result. If it failed, explain briefly and give the "
-            "corrected command. If it worked and steps remain, give only the "
-            "next command. If the task is complete, reply DONE and give no "
-            "code block.")
+            f"{head}"
+            f"Output:\n```\n{output or '(no output)'}\n```{note}{warn}\n\n"
+            f"{step}Read the output and check the result against the goal. If "
+            "it failed, explain briefly and give the corrected command. If it "
+            "worked and steps remain, give only the next single command, chosen "
+            "from what this output shows. If the task is complete, reply DONE "
+            "with a short summary and give no code block.")
+        if auto:
+            payload += f"\n\n{AGENT_RULES}"
 
-        shown = output if len(output) <= 1500 else output[:1500] + "\n… truncated …"
+        # The transcript shows a preview; the full text is in the terminal.
+        preview = self.PREVIEW_CHARS
+        shown = (full_output if len(full_output) <= preview
+                 else full_output[:preview].rsplit("\n", 1)[0])
         display = (f"Ran:\n```\n{command}\n```\nOutput:\n```\n"
                    f"{shown or '(no output)'}\n```")
+        if len(full_output) > preview:
+            display += (f"\n*Preview only — "
+                        f"{self._size_note(len(full_output), len(output) if cut else len(full_output))}.*")
 
-        self._dispatch(payload, display)
+        self._dispatch(payload, display, short=short)
 
     def _clear_blocks(self):
         """Drop the previous round's commands.
@@ -588,20 +937,38 @@ class ChatPanel(QWidget):
         self.code_picker.setVisible(False)
         self.run_btn.setVisible(False)
 
-    def _dispatch(self, payload: str, display: str):
+    KEEP_FULL_RESULTS = 2   # newest command outputs sent in full
+    PREVIEW_CHARS = 3000    # output shown in the transcript (display only)
+
+    def _api_messages(self) -> list:
+        """The history as sent: older command outputs cut down to a summary."""
+        results = [i for i, m in enumerate(self.messages) if "short" in m]
+        old = set(results[:-self.KEEP_FULL_RESULTS])
+        return [{"role": m["role"],
+                 "content": m["short"] if i in old else m["content"]}
+                for i, m in enumerate(self.messages)]
+
+    def _dispatch(self, payload: str, display: str, short: str = None):
         """Append a user turn and start a request."""
         self._clear_blocks()
-        self.messages.append({"role": "user", "content": payload})
+        msg = {"role": "user", "content": payload}
+        if short:
+            msg["short"] = short
+        self.messages.append(msg)
         self._display.append(("user", display))
         self._display.append(("assistant", ""))
+        self.streaming = True
+        self._req_started = time.monotonic()
+        self._answer_started = 0.0
         self._render(follow=True)
 
-        self.streaming = True
         self.send_btn.setVisible(False)
         self.stop_btn.setVisible(True)
+        self._wait_timer.start(1000)
 
-        self.worker = ChatWorker(self.cfg, list(self.messages), self)
+        self.worker = ChatWorker(self.cfg, self._api_messages(), self)
         self.worker.chunk.connect(self._on_chunk)
+        self.worker.thinking.connect(self._on_thinking)
         self.worker.finished_ok.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()

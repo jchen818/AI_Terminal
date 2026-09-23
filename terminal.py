@@ -9,6 +9,7 @@ including cursor movement, colours, doskey history and Ctrl+C.
 import os
 import re
 import sys
+import time
 from collections import deque
 
 from PySide6.QtCore import QEvent, QRect, Qt, QThread, QTimer, Signal
@@ -27,8 +28,16 @@ ANSI_RE = re.compile(
     r"|\x1b[=>NOM78]"                         # single-char escapes
     r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # stray control bytes
 
-# A trailing shell prompt: ends in $, #, > or % (bash, root, cmd, zsh).
-PROMPT_RE = re.compile(r"(?:[$#>%]|\$\s|PS[^>]*>)\s*$")
+# A trailing shell prompt. Kept narrow on purpose: a loose "ends in > or %"
+# rule fires on progress bars ("100%") and HTML, which made a still-running
+# command look finished. Custom prompts are also matched exactly against the
+# prompt that was on screen when the command started (see _begin_capture).
+PROMPT_RE = re.compile(r"""
+      ^[A-Za-z]:\\[^>]*>\s*$                        # cmd.exe     C:\Users\me>
+    | ^PS\s.*>\s*$                                  # PowerShell  PS C:\x>
+    | ^(\([^)]*\)\s*)?\[?[\w.-]+@[\w.-]+[^\n]*[$#%]\s*$   # user@host:~$  [root@h x]#
+    | ^\S{0,40}[$#]\s*$                             # bare  $  #  bash-5.1$
+    """, re.X)
 
 # Output that is asking a question rather than finishing.
 WAITING_RE = re.compile(
@@ -163,7 +172,9 @@ class TerminalWidget(QWidget):
         self._capture_buf = []
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
-        self._idle_timer.timeout.connect(lambda: self._finish_capture("ok"))
+        self._idle_timer.timeout.connect(self._check_capture)
+        self._capture_prompt = ""
+        self._last_data = 0.0
         self._capture_deadline = QTimer(self)
         self._capture_deadline.setSingleShot(True)
         self._capture_deadline.timeout.connect(
@@ -317,10 +328,28 @@ class TerminalWidget(QWidget):
 
     # -------------------------------------------------------- capture
 
+    @property
+    def busy(self) -> bool:
+        """A command we started is still being watched."""
+        return self._capturing
+
+    def _cursor_line(self) -> str:
+        if self.screen is None:
+            return ""
+        try:
+            return self.screen.display[self.screen.cursor.y].rstrip()
+        except (IndexError, AttributeError):
+            return ""
+
     def _begin_capture(self, command: str):
         self._capturing = True
         self._capture_cmd = command
         self._capture_buf = []
+        # Whatever sits on the cursor line right now is the shell's prompt.
+        # Seeing it again later means the command has handed control back,
+        # even for prompts PROMPT_RE does not know.
+        self._capture_prompt = self._cursor_line().strip()
+        self._last_data = time.monotonic()
         idle = int(self.cfg.get("capture_idle_ms", 900))
         limit = int(self.cfg.get("capture_timeout_s", 180)) * 1000
         self._idle_timer.start(idle)
@@ -331,6 +360,31 @@ class TerminalWidget(QWidget):
         self._idle_timer.stop()
         self._capture_deadline.stop()
 
+    def _check_capture(self):
+        """The shell went quiet. Decide whether the command is really done.
+
+        Silence alone is not enough: package installs, downloads, ssh and
+        builds all pause. Done means the prompt is back. A question on the
+        last line means it wants input. Anything else keeps waiting, until
+        the output has been silent for capture_stall_s with no prompt.
+        """
+        if not self._capturing:
+            return
+        raw = "".join(self._capture_buf)
+        _, at_prompt, waiting = self._clean_output(
+            raw, self._capture_cmd, self._capture_prompt)
+        if at_prompt:
+            self._finish_capture("ok")
+            return
+        if waiting:
+            self._finish_capture("waiting")
+            return
+        stall = float(self.cfg.get("capture_stall_s", 30))
+        if time.monotonic() - self._last_data >= stall:
+            self._finish_capture("stalled")
+            return
+        self._idle_timer.start(int(self.cfg.get("capture_idle_ms", 900)))
+
     def _finish_capture(self, status: str):
         if not self._capturing:
             return
@@ -340,13 +394,14 @@ class TerminalWidget(QWidget):
 
         raw = "".join(self._capture_buf)
         self._capture_buf = []
-        output, at_prompt, waiting = self._clean_output(raw, self._capture_cmd)
+        output, at_prompt, waiting = self._clean_output(
+            raw, self._capture_cmd, self._capture_prompt)
         if status == "ok" and waiting and not at_prompt:
             status = "waiting"
         self.command_output.emit(self._capture_cmd, output, status)
 
     @staticmethod
-    def _clean_output(raw: str, command: str):
+    def _clean_output(raw: str, command: str, prompt: str = ""):
         """Turn a raw pty stream into something worth showing a model."""
         text = ANSI_RE.sub("", raw).replace("\r\n", "\n")
 
@@ -366,7 +421,9 @@ class TerminalWidget(QWidget):
         while lines and not lines[-1].strip():
             lines.pop()
 
-        at_prompt = bool(lines and PROMPT_RE.search(lines[-1]))
+        last = lines[-1].strip() if lines else ""
+        at_prompt = bool(last and (PROMPT_RE.search(last)
+                                   or (prompt and last == prompt)))
         if at_prompt:
             lines.pop()                        # trailing prompt is not output
             while lines and not lines[-1].strip():
@@ -374,13 +431,12 @@ class TerminalWidget(QWidget):
 
         waiting = bool(lines and WAITING_RE.search(lines[-1]))
 
-        # Keep the context bill sane on chatty commands.
-        if len(lines) > 200:
-            head, tail = lines[:60], lines[-140:]
-            lines = head + [f"… {len(lines) - 200} lines omitted …"] + tail
+        # No trimming here: the chat pane decides how much reaches the model
+        # (Settings → Chat → Output sent to AI) and tells it what was left out.
+        # This cap only guards memory against a runaway command.
         out = "\n".join(lines)
-        if len(out) > 12000:
-            out = out[:6000] + "\n… truncated …\n" + out[-6000:]
+        if len(out) > 2_000_000:
+            out = out[-2_000_000:]
         return out, at_prompt, waiting
 
     def _on_data(self, text: str):
@@ -388,6 +444,7 @@ class TerminalWidget(QWidget):
             return
         if self._capturing:
             self._capture_buf.append(text)
+            self._last_data = time.monotonic()
             self._idle_timer.start(int(self.cfg.get("capture_idle_ms", 900)))
         before = self._max_offset()
         self.stream.feed(text)
@@ -611,6 +668,8 @@ class TerminalWidget(QWidget):
 
         if self._capturing:
             self.cancel_capture()
+            self.notice.emit("You took over — the assistant stopped watching "
+                             "this command")
 
         # Typing snaps back to the live prompt.
         if self.scroll_offset:
@@ -894,9 +953,6 @@ class TerminalWidget(QWidget):
         self.notice.emit(f"Copied {lines} line{'s' if lines > 1 else ''}")
         return True
 
-    CAPTURE_HEAD_LINES = 150
-    CAPTURE_TAIL_LINES = 350
-    CAPTURE_MAX_CHARS = 20000
 
     def _row_text(self, row) -> str:
         return "".join((row[x].data or " ") for x in range(self.cols)).rstrip()
@@ -936,15 +992,8 @@ class TerminalWidget(QWidget):
         if not lines:
             return ""
 
-        if len(lines) > self.CAPTURE_HEAD_LINES + self.CAPTURE_TAIL_LINES:
-            omitted = len(lines) - self.CAPTURE_HEAD_LINES - self.CAPTURE_TAIL_LINES
-            lines = (lines[:self.CAPTURE_HEAD_LINES]
-                     + [f"… {omitted} lines omitted …"]
-                     + lines[-self.CAPTURE_TAIL_LINES:])
+        # Sized for the model by the chat pane, which knows the limit.
         text = "\n".join(lines)
-        if len(text) > self.CAPTURE_MAX_CHARS:
-            half = self.CAPTURE_MAX_CHARS // 2
-            text = text[:half] + "\n… truncated …\n" + text[-half:]
 
         if dropped:
             note = (f"(…{dropped} earlier line{'s' if dropped != 1 else ''} scrolled "

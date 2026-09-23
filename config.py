@@ -124,8 +124,31 @@ DEFAULTS = {
     "term": "xterm-256color",
     # Result checking: how long the shell must be quiet before a command is
     # considered finished, and the hard ceiling on waiting for one.
+    # capture_idle_ms is how often a quiet shell is checked for its prompt;
+    # a command only counts as finished once the prompt is back. With no
+    # prompt and no output for capture_stall_s, auto-run pauses.
     "capture_idle_ms": 900,
+    "capture_stall_s": 30,
     "capture_timeout_s": 180,
+    # Auto-run: most command→read→decide steps before handing control back.
+    "auto_run_max_steps": 20,
+    # Most terminal output sent to the model in one message. Beyond it the
+    # middle is left out and the model is told which lines are missing.
+    "ai_output_chars": 24000,
+}
+
+AI_OUTPUT_LIMITS = {
+    8000: "Compact — 8,000 characters (small/local models)",
+    24000: "Standard — 24,000 characters",
+    60000: "Large — 60,000 characters",
+    200000: "Full — 200,000 characters (large-context models)",
+}
+
+AUTO_RUN_LIMITS = {
+    5: "5 steps — short fixes",
+    10: "10 steps",
+    20: "20 steps — default",
+    40: "40 steps — long jobs",
 }
 
 
@@ -242,7 +265,29 @@ class SettingsDialog(QDialog):
         self.chat_font_size.setRange(7, 28)
         self.chat_font_size.setValue(int(self.cfg.get("chat_font_size", 10)))
 
+        self.auto_steps = QComboBox()
+        for n, label in AUTO_RUN_LIMITS.items():
+            self.auto_steps.addItem(label, n)
+        idx = self.auto_steps.findData(int(self.cfg.get("auto_run_max_steps", 20)))
+        self.auto_steps.setCurrentIndex(idx if idx >= 0 else 2)
+        self.auto_steps.setToolTip(
+            "How many commands auto-run may execute on its own, each after "
+            "reading the previous output, before it pauses and hands back.")
+
         cform.addRow("Font size", self.chat_font_size)
+        self.ai_output = QComboBox()
+        for n, label in AI_OUTPUT_LIMITS.items():
+            self.ai_output.addItem(label, n)
+        idx = self.ai_output.findData(int(self.cfg.get("ai_output_chars", 24000)))
+        self.ai_output.setCurrentIndex(idx if idx >= 0 else 1)
+        self.ai_output.setToolTip(
+            "How much terminal output goes to the assistant per message. Longer "
+            "output keeps its start and end; the assistant is told which lines "
+            "were left out so it can ask for them with grep, sed or tail.\n"
+            "Pick a size your model's context window can hold.")
+
+        cform.addRow("Auto-run limit", self.auto_steps)
+        cform.addRow("Output sent to AI", self.ai_output)
 
         # --- Terminal ----------------------------------------------------
         term_box = QGroupBox("Terminal")
@@ -340,6 +385,8 @@ class SettingsDialog(QDialog):
             "system_prompt": self.system_prompt.toPlainText(),
             "window_size": self.window_size.currentData(),
             "chat_font_size": self.chat_font_size.value(),
+            "auto_run_max_steps": self.auto_steps.currentData(),
+            "ai_output_chars": self.ai_output.currentData(),
             "shell": self.shell.currentText().strip(),
             "font_family": self.font_family.currentText().strip(),
             "font_size": self.font_size.value(),

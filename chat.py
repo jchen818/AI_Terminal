@@ -4,7 +4,8 @@ import re
 import time
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtGui import (QFont, QGuiApplication, QKeySequence, QShortcut,
+                           QTextDocument)
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
     QPushButton, QTextBrowser, QVBoxLayout, QWidget,
@@ -71,6 +72,17 @@ AGENT_RULES = (
 DONE_RE = re.compile(r"^\W*DONE\b", re.M)
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+
+# Markdown with raw HTML switched off. Qt's parser otherwise passes <tags>
+# straight to its HTML engine, so a stray <td>, <li> or <none> in a reply or
+# in terminal output turns into tables and bullets and swallows the text
+# after it.
+_MD = QTextDocument.MarkdownFeature
+MARKDOWN_TEXT_ONLY = _MD(_MD.MarkdownDialectGitHub.value | _MD.MarkdownNoHTML.value)
+
+
+def set_markdown(view, text: str):
+    view.document().setMarkdown(text, MARKDOWN_TEXT_ONLY)
 
 
 def split_thinking(text: str):
@@ -368,6 +380,7 @@ class ChatPanel(QWidget):
         self._countdown = 0
         self._auto_chain = 0
         self._last_run = ""
+        self._last_trim = 0
 
         # --- composer ------------------------------------------------------
         self.input = QuickEditInput()
@@ -457,7 +470,8 @@ class ChatPanel(QWidget):
         self.code_picker.clear()
         self.code_picker.setVisible(False)
         self.run_btn.setVisible(False)
-        self.view.setMarkdown(
+        set_markdown(
+            self.view,
             "Ask a question, or tick **Include terminal screen** to ask about "
             "what the shell just printed.\n\n"
             "Commands the assistant suggests in code blocks can be sent "
@@ -483,6 +497,7 @@ class ChatPanel(QWidget):
 
         display = text
         payload = text
+        short = None
         if self.include_output.isChecked():
             screen = self.terminal.capture_since_last() if self.terminal else ""
             if screen:
@@ -491,17 +506,22 @@ class ChatPanel(QWidget):
                 payload = (f"{text}\n\nHere is the terminal output since it was "
                            f"last attached:\n```\n{screen}\n```"
                            f"{chr(10) * 2 + cut if cut else ''}")
+                short = (f"{text}\n\n(Terminal output was attached here; "
+                         f"shortened, already handled):\n```\n"
+                         f"{clip(screen, 800)}\n```")
                 display = (f"{text}\n\n*(terminal output attached — "
                            f"{self._size_note(full, len(screen) if cut else full)})*")
 
         if self.auto_run.isChecked():
             payload = f"{payload}\n\n{AGENT_RULES}"
+            if short:
+                short = f"{short}\n\n{AGENT_RULES}"
             display += "\n\n*(auto-run: step by step)*"
 
         self.input.clear()
         self._auto_chain = 0          # a typed message starts a fresh chain
         self._chain_log = []
-        self._dispatch(payload, display)
+        self._dispatch(payload, display, short=short)
 
     def stop(self):
         if self.worker is not None:
@@ -652,7 +672,7 @@ class ChatPanel(QWidget):
             bar.value() >= bar.maximum() - 40)
         previous = bar.value()
 
-        self.view.setMarkdown("\n\n---\n\n".join(parts))
+        set_markdown(self.view, "\n\n---\n\n".join(parts))
 
         if at_bottom:
             bar.setValue(bar.maximum())
@@ -746,7 +766,14 @@ class ChatPanel(QWidget):
 
     @property
     def output_budget(self) -> int:
-        return max(2000, int(self.cfg.get("ai_output_chars", 24000)))
+        wanted = max(2000, int(self.cfg.get("ai_output_chars", 24000)))
+        # One output may take at most half the conversation budget, or a
+        # single result pushes everything else out.
+        return min(wanted, self.context_budget // 2)
+
+    @property
+    def context_budget(self) -> int:
+        return max(8000, int(self.cfg.get("context_chars", 96000)))
 
     @staticmethod
     def _size_note(full: int, sent: int) -> str:
@@ -941,12 +968,38 @@ class ChatPanel(QWidget):
     PREVIEW_CHARS = 3000    # output shown in the transcript (display only)
 
     def _api_messages(self) -> list:
-        """The history as sent: older command outputs cut down to a summary."""
+        """The history as sent: fitted to the model's context window.
+
+        Older command outputs and attachments are cut down to a summary, then
+        the oldest turns are dropped until the whole thing fits the context
+        budget. A request bigger than the model's window does not always fail
+        cleanly: some servers silently cut the start (including the chat
+        template) and the model answers with gibberish.
+        """
         results = [i for i, m in enumerate(self.messages) if "short" in m]
         old = set(results[:-self.KEEP_FULL_RESULTS])
-        return [{"role": m["role"],
+        msgs = [{"role": m["role"],
                  "content": m["short"] if i in old else m["content"]}
                 for i, m in enumerate(self.messages)]
+
+        budget = self.context_budget - len(self.cfg.get("system_prompt", ""))
+        dropped = 0
+        while len(msgs) > 1 and sum(len(m["content"]) for m in msgs) > budget:
+            msgs.pop(0)
+            dropped += 1
+            # A conversation must start with a user turn.
+            while len(msgs) > 1 and msgs[0]["role"] != "user":
+                msgs.pop(0)
+                dropped += 1
+        if dropped:
+            msgs[0] = {"role": "user", "content":
+                       f"(Earlier conversation — {dropped} messages — was left "
+                       f"out to fit your context window.)\n\n{msgs[0]['content']}"}
+            if dropped != self._last_trim:
+                self.notice.emit(f"Oldest {dropped} messages left out to fit the "
+                                 "model's context window")
+        self._last_trim = dropped
+        return msgs
 
     def _dispatch(self, payload: str, display: str, short: str = None):
         """Append a user turn and start a request."""

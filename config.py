@@ -135,6 +135,17 @@ DEFAULTS = {
     # Most terminal output sent to the model in one message. Beyond it the
     # middle is left out and the model is told which lines are missing.
     "ai_output_chars": 24000,
+    # Most characters of conversation sent per request. Oldest turns are
+    # dropped beyond it. Roughly 4 characters per token.
+    "context_chars": 96000,
+}
+
+CONTEXT_LIMITS = {
+    24000: "Small — 24,000 characters (~8K-token models)",
+    48000: "Medium — 48,000 characters (~16K tokens)",
+    96000: "Standard — 96,000 characters (~32K tokens)",
+    240000: "Large — 240,000 characters (~64K+ tokens)",
+    480000: "Huge — 480,000 characters (~128K+ tokens)",
 }
 
 AI_OUTPUT_LIMITS = {
@@ -286,8 +297,21 @@ class SettingsDialog(QDialog):
             "were left out so it can ask for them with grep, sed or tail.\n"
             "Pick a size your model's context window can hold.")
 
+        self.context = QComboBox()
+        for n, label in CONTEXT_LIMITS.items():
+            self.context.addItem(label, n)
+        idx = self.context.findData(int(self.cfg.get("context_chars", 96000)))
+        self.context.setCurrentIndex(idx if idx >= 0 else 2)
+        self.context.setToolTip(
+            "Most conversation sent per request. When a chat grows past it the "
+            "oldest messages are left out.\n"
+            "Pick one below your model's context window (the server's "
+            "max_model_len / num_ctx). Too large and some servers cut the "
+            "request themselves, and the model replies with gibberish.")
+
         cform.addRow("Auto-run limit", self.auto_steps)
         cform.addRow("Output sent to AI", self.ai_output)
+        cform.addRow("Context window", self.context)
 
         # --- Terminal ----------------------------------------------------
         term_box = QGroupBox("Terminal")
@@ -389,6 +413,7 @@ class SettingsDialog(QDialog):
             "chat_font_size": self.chat_font_size.value(),
             "auto_run_max_steps": self.auto_steps.currentData(),
             "ai_output_chars": self.ai_output.currentData(),
+            "context_chars": self.context.currentData(),
             "shell": self.shell.currentText().strip(),
             "font_family": self.font_family.currentText().strip(),
             "font_size": self.font_size.value(),

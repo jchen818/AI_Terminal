@@ -1,5 +1,6 @@
 """The right-hand pane: conversation, composer, and the bridge to the shell."""
 
+from collections import Counter
 import re
 import time
 
@@ -148,7 +149,28 @@ def is_repeating(text: str) -> bool:
             end -= n
         if count >= 8 and count * n >= 300:
             return True
-    return False
+    return _repeats_loosely(text)
+
+
+def _repeats_loosely(text: str, window: int = 4000, n: int = 6,
+                     min_words: int = 150, share: float = 0.6) -> bool:
+    """Catch loops whose wording drifts between repeats.
+
+    Reasoning models often restate one idea with a new lead-in each time
+    ("Maybe use X…", "Let's think of using X…", "Could use X…"), or cycle
+    through several sentences ("the output says X… wait… the output is
+    just (no output)…"), so no exact unit repeats back to back. Instead:
+    split the tail into 6-word phrases and flag it when 60% of them occur
+    3+ times. Normal
+    prose, and even code, almost never reuses that many long phrases.
+    """
+    words = text[-window:].lower().split()
+    if len(words) < min_words:
+        return False
+    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    counts = Counter(grams)
+    repeated = sum(1 for g in grams if counts[g] >= 3)
+    return repeated / len(grams) >= share
 
 
 def fit_output(text: str, budget: int):
@@ -928,9 +950,15 @@ class ChatPanel(QWidget):
         # step made each request bigger and slower than the last.
         short = (f"{head}Output (shortened, already handled):\n```\n"
                  f"{clip(output or '(no output)', 800)}\n```")
+        body = (f"Output:\n```\n{output}\n```" if output.strip() else
+                "Output: none. The command printed nothing and the shell "
+                "returned to the prompt. For commands like systemctl enable, "
+                "mkdir or cp that normally means it succeeded."
+                if status not in ("timeout", "stalled") else
+                "Output: none so far.")
         payload = (
             f"{head}"
-            f"Output:\n```\n{output or '(no output)'}\n```{note}{warn}\n\n"
+            f"{body}{note}{warn}\n\n"
             f"{step}Read the output and check the result against the goal. If "
             "it failed, explain briefly and give the corrected command. If it "
             "worked and steps remain, give only the next single command, chosen "

@@ -425,8 +425,13 @@ class TerminalWidget(QWidget):
                 line = line.split("\r")[-1]   # keep only the final redraw
             lines.append(line.rstrip())
 
-        # Drop the shell's echo of what we just typed.
+        # Drop the shell's echo of what we just typed. The stream often starts
+        # with a blank line or a redraw (ssh, ConPTY), so skip blanks first:
+        # checking only lines[0] let the echo through, and the model was then
+        # told the command "printed" itself — which sent it round in circles.
         for cmd_line in [c.strip() for c in command.splitlines() if c.strip()]:
+            while lines and not lines[0].strip():
+                lines.pop(0)
             if lines and cmd_line[:40] in lines[0]:
                 lines.pop(0)
 

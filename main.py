@@ -145,6 +145,9 @@ class MainWindow(QMainWindow):
         focus_chat.setShortcut(QKeySequence("Ctrl+2"))
         focus_chat.triggered.connect(self.chat.input.setFocus)
         chat_menu.addAction(new_chat)
+        memory_action = QAction("Memory…", self)
+        memory_action.triggered.connect(self.chat._edit_memory)
+        chat_menu.addAction(memory_action)
         chat_menu.addAction(explain)
         chat_menu.addAction(focus_chat)
 
@@ -202,6 +205,7 @@ class MainWindow(QMainWindow):
             "Ctrl+, settings")
 
     def closeEvent(self, event):
+        self.chat.save_chat()
         self.chat.stop()
         self.terminal.close_session()
         super().closeEvent(event)

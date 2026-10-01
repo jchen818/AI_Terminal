@@ -605,7 +605,9 @@ class TerminalWidget(QWidget):
 
     KEYMAP = {int(k): v for k, v in {
         Qt.Key_Return: "\r", Qt.Key_Enter: "\r",
-        Qt.Key_Backspace: "\x08", Qt.Key_Tab: "\t",
+        # DEL, not BS: ConPTY reads \x08 as Ctrl+Backspace, which PSReadLine
+        # binds to delete-previous-word. Windows Terminal sends \x7f too.
+        Qt.Key_Backspace: "\x7f", Qt.Key_Tab: "\t",
         Qt.Key_Backtab: "\x1b[Z",
         Qt.Key_Escape: "\x1b",
         Qt.Key_Up: "\x1b[A", Qt.Key_Down: "\x1b[B",
@@ -626,6 +628,7 @@ class TerminalWidget(QWidget):
     KEY_A, KEY_Z = int(Qt.Key_A), int(Qt.Key_Z)
     KEY_C, KEY_V = int(Qt.Key_C), int(Qt.Key_V)
     ENTER_KEYS = (int(Qt.Key_Return), int(Qt.Key_Enter))
+    KEY_BACKSPACE = int(Qt.Key_Backspace)
 
     def keyPressEvent(self, event):
         key = int(event.key())
@@ -670,7 +673,9 @@ class TerminalWidget(QWidget):
                 return
 
         # Work out what this key sends, if anything.
-        if key in self.KEYMAP:
+        if key == self.KEY_BACKSPACE and ctrl:
+            payload = "\x08"  # Ctrl+Backspace: delete previous word
+        elif key in self.KEYMAP:
             payload = self.KEYMAP[key]
         elif ctrl and self.KEY_A <= key <= self.KEY_Z:
             payload = chr(key - self.KEY_A + 1)

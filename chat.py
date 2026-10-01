@@ -8,10 +8,12 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (QFont, QGuiApplication, QKeySequence, QShortcut,
                            QTextDocument)
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
-    QPushButton, QTextBrowser, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QTextBrowser, QVBoxLayout,
+    QWidget,
 )
 
+import memory
 from ai_client import ChatWorker
 
 CODE_BLOCK = re.compile(r"```([\w+-]*)[ \t]*\n(.*?)```", re.DOTALL)
@@ -351,10 +353,19 @@ class ChatPanel(QWidget):
         new_btn = QPushButton("New chat")
         new_btn.setFixedWidth(90)
         new_btn.clicked.connect(self.new_chat)
+        self.history_btn = QPushButton("History")
+        self.history_btn.setFixedWidth(80)
+        self.history_btn.setToolTip(
+            "Reopen an earlier chat, or view and edit what the assistant "
+            "remembers between chats.")
+        self.history_menu = QMenu(self)
+        self.history_menu.aboutToShow.connect(self._fill_history_menu)
+        self.history_btn.setMenu(self.history_menu)
 
         header = QHBoxLayout()
         header.addWidget(QLabel("Assistant"))
         header.addWidget(self.model_label, 1)
+        header.addWidget(self.history_btn)
         header.addWidget(new_btn)
         header.addWidget(settings_btn)
 
@@ -461,6 +472,13 @@ class ChatPanel(QWidget):
         self._thinking = {}     # display index -> reasoning streamed separately
         self._think_secs = {}   # display index -> seconds spent thinking
 
+        # Saved history and memory of earlier chats.
+        self.chat_id = memory.new_chat_id()
+        self.chat_title = ""
+        self.chat_created = time.time()
+        self._run_log = []      # [{command, result}] for this chat
+        self._memory = ""       # digest of earlier chats, fixed per chat
+
         self.refresh_config(cfg)
         self.new_chat()
 
@@ -473,6 +491,7 @@ class ChatPanel(QWidget):
         label = PROVIDERS.get(cfg.get("provider", ""), {}).get("label", "custom")
         self.model_label.setText(f"{label} · {model}")
         self.apply_font(int(cfg.get("chat_font_size", 10)))
+        self._load_memory()
 
     def apply_font(self, size: int):
         font = QFont(self.view.font())
@@ -481,24 +500,153 @@ class ChatPanel(QWidget):
         self.view.document().setDefaultFont(font)
         self.input.setFont(font)
 
-    def new_chat(self):
+    def _reset_state(self):
         self.stop()
         self._cancel_auto_run()
         self._auto_chain = 0
+        self._chain_log = []
         self.messages = []
         self._display_list = []
         self._thinking = {}
         self._think_secs = {}
+        self._run_log = []
         self.code_picker.clear()
         self.code_picker.setVisible(False)
         self.run_btn.setVisible(False)
-        set_markdown(
-            self.view,
-            "Ask a question, or tick **Include terminal screen** to ask about "
-            "what the shell just printed.\n\n"
-            "Commands the assistant suggests in code blocks can be sent "
-            "straight to the terminal.")
+
+    def new_chat(self):
+        self.save_chat()
+        self._reset_state()
+        self.chat_id = memory.new_chat_id()
+        self.chat_title = ""
+        self.chat_created = time.time()
+        self._load_memory()
+        intro = ("Ask a question, or tick **Include terminal screen** to ask "
+                 "about what the shell just printed.\n\n"
+                 "Commands the assistant suggests in code blocks can be sent "
+                 "straight to the terminal.")
+        if self._memory:
+            intro += ("\n\n*The assistant remembers your recent chats. "
+                      "**History** reopens one, or shows what it remembers.*")
+        set_markdown(self.view, intro)
         self.input.setFocus()
+
+    # ------------------------------------------------------------ memory
+
+    @property
+    def memory_sessions(self) -> int:
+        return max(0, int(self.cfg.get("memory_sessions", 10)))
+
+    def _load_memory(self):
+        """Build the digest of earlier chats once per chat.
+
+        Fixed for the life of a chat so every request in it sends the same
+        system prompt, which keeps servers' prompt caches warm.
+        """
+        try:
+            self._memory = memory.memory_prompt(
+                self.memory_sessions, exclude=self.chat_id,
+                budget=min(memory.MEMORY_CHARS, self.context_budget // 4))
+        except OSError:
+            self._memory = ""
+
+    def _request_cfg(self) -> dict:
+        cfg = dict(self.cfg)
+        if self._memory:
+            base = cfg.get("system_prompt", "").strip()
+            cfg["system_prompt"] = f"{base}\n\n{self._memory}" if base else self._memory
+        return cfg
+
+    def save_chat(self):
+        """Write this chat to disk. Chats with nothing sent are not kept."""
+        if not self.messages:
+            return
+        display = [[r, c] for r, c in self._display]
+        if self.streaming and display and display[-1][0] == "assistant":
+            display[-1][1] = (display[-1][1] + "\n\n*(Interrupted — the app "
+                              "was closed or the chat switched.)*")
+        chat = {
+            "id": self.chat_id,
+            "title": self.chat_title or "Untitled chat",
+            "created": self.chat_created,
+            "updated": time.time(),
+            "model": self.cfg.get("model", ""),
+            "messages": self.messages,
+            "display": display,
+            "thinking": {str(k): v for k, v in self._thinking.items()},
+            "think_secs": {str(k): v for k, v in self._think_secs.items()},
+            "log": self._run_log,
+        }
+        try:
+            memory.save_chat(chat)
+        except OSError as exc:
+            self.notice.emit(f"Could not save chat history: {exc}")
+
+    def open_chat(self, chat_id: str):
+        if chat_id == self.chat_id:
+            return
+        data = memory.load_chat(chat_id)
+        if data is None:
+            self.notice.emit("That chat could not be opened")
+            return
+        self.save_chat()
+        self._reset_state()
+        self.chat_id = data.get("id", chat_id)
+        self.chat_title = data.get("title", "")
+        self.chat_created = data.get("created", time.time())
+        self.messages = data.get("messages", [])
+        self._display_list = [tuple(x) for x in data.get("display", [])]
+        self._thinking = {int(k): v for k, v in data.get("thinking", {}).items()}
+        self._think_secs = {int(k): v for k, v in data.get("think_secs", {}).items()}
+        self._run_log = data.get("log", [])
+        self._load_memory()
+        self._render(follow=True)
+        self.notice.emit(f"Opened: {self.chat_title}")
+        self.input.setFocus()
+
+    def _fill_history_menu(self):
+        menu = self.history_menu
+        menu.clear()
+        chats = memory.list_chats(limit=30)
+        if not chats:
+            empty = menu.addAction("No saved chats yet")
+            empty.setEnabled(False)
+        today = time.strftime("%Y-%m-%d")
+        for c in chats:
+            stamp = time.localtime(c["updated"])
+            when = (time.strftime("%H:%M", stamp)
+                    if time.strftime("%Y-%m-%d", stamp) == today
+                    else time.strftime("%b %d %H:%M", stamp))
+            act = menu.addAction(f"{when}   {c['title']}")
+            act.setCheckable(True)
+            act.setChecked(c["id"] == self.chat_id)
+            act.triggered.connect(lambda _=False, cid=c["id"]: self.open_chat(cid))
+        menu.addSeparator()
+        delete = menu.addAction("Delete this chat")
+        delete.setEnabled(bool(self.messages))
+        delete.triggered.connect(self._delete_current)
+        menu.addAction("Memory…").triggered.connect(self._edit_memory)
+
+    def _delete_current(self):
+        if QMessageBox.question(
+                self, "Delete chat?",
+                f"Delete “{self.chat_title or 'this chat'}” from history? The "
+                "assistant will no longer remember it.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        memory.delete_chat(self.chat_id)
+        self.messages = []          # so new_chat does not save it again
+        self.new_chat()
+        self.notice.emit("Chat deleted")
+
+    def _edit_memory(self):
+        dlg = MemoryDialog(self.memory_sessions, self.chat_id, self)
+        dlg.exec()
+        if dlg.cleared:
+            self.messages = []      # the open chat went with the rest
+            self.new_chat()
+        else:
+            self._load_memory()
 
     # -------------------------------------------------------------- send
 
@@ -540,6 +688,8 @@ class ChatPanel(QWidget):
                 short = f"{short}\n\n{AGENT_RULES}"
             display += "\n\n*(auto-run: step by step)*"
 
+        if not self.chat_title:
+            self.chat_title = memory.title_from(text)
         self.input.clear()
         self._auto_chain = 0          # a typed message starts a fresh chain
         self._chain_log = []
@@ -607,6 +757,7 @@ class ChatPanel(QWidget):
         if self.auto_run.isChecked():
             self.auto_run.setChecked(False)
         self.notice.emit("Reply cut off — the model was looping. Auto-run paused")
+        self.save_chat()
         self._render()
 
     def _on_done(self):
@@ -623,7 +774,11 @@ class ChatPanel(QWidget):
             self._display[-1] = (role, raw if raw.strip() else "*(empty response)*")
         else:
             self.messages.append({"role": "assistant", "content": content})
+            saved = memory.add_notes(content)
+            if saved:
+                self.notice.emit("Remembered: " + "; ".join(saved)[:120])
         self.streaming = False
+        self.save_chat()
         self._render()
         self._collect_code_blocks(content)
         self.stop()
@@ -642,6 +797,7 @@ class ChatPanel(QWidget):
         if self.messages and self.messages[-1]["role"] == "user":
             self.messages.pop()   # let the user retry cleanly
         self.stop()
+        self.save_chat()
 
     # ------------------------------------------------------------ render
 
@@ -890,6 +1046,13 @@ class ChatPanel(QWidget):
 
     def on_command_output(self, command: str, output: str, status: str):
         """The terminal finished a command we started. Send the result back."""
+        result = {"timeout": "did not finish (timed out)",
+                  "stalled": "did not finish (stalled)",
+                  "waiting": "stopped waiting for input"}.get(
+            status, "failed" if looks_failed(output) else "ok")
+        self._run_log.append({"command": command, "result": result,
+                              "time": time.time()})
+        self.save_chat()
         auto = self.auto_run.isChecked()
         if not (self.check_results.isChecked() or auto):
             return
@@ -1010,7 +1173,8 @@ class ChatPanel(QWidget):
                  "content": m["short"] if i in old else m["content"]}
                 for i, m in enumerate(self.messages)]
 
-        budget = self.context_budget - len(self.cfg.get("system_prompt", ""))
+        budget = (self.context_budget - len(self.cfg.get("system_prompt", ""))
+                  - len(self._memory))
         dropped = 0
         while len(msgs) > 1 and sum(len(m["content"]) for m in msgs) > budget:
             msgs.pop(0)
@@ -1047,7 +1211,7 @@ class ChatPanel(QWidget):
         self.stop_btn.setVisible(True)
         self._wait_timer.start(1000)
 
-        self.worker = ChatWorker(self.cfg, self._api_messages(), self)
+        self.worker = ChatWorker(self._request_cfg(), self._api_messages(), self)
         self.worker.chunk.connect(self._on_chunk)
         self.worker.thinking.connect(self._on_thinking)
         self.worker.finished_ok.connect(self._on_done)
@@ -1090,3 +1254,78 @@ class ChatPanel(QWidget):
 
     def new_chat_shortcut(self):
         self.new_chat()
+
+
+class MemoryDialog(QDialog):
+    """Shows what the assistant remembers, and lets the notes be edited."""
+
+    def __init__(self, sessions: int, current_id: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Memory")
+        self.setMinimumSize(620, 560)
+        self.cleared = False
+        self._sessions, self._current = sessions, current_id
+
+        notes_label = QLabel(
+            "<b>Saved notes</b> — facts the assistant keeps across chats. It "
+            "adds to these itself (lines it starts with REMEMBER:); edit or "
+            "delete freely, one per line.")
+        notes_label.setWordWrap(True)
+        self.notes = QPlainTextEdit(memory.load_notes())
+        self.notes.setPlaceholderText(
+            "- web01 is reached with: ssh admin@10.0.0.5 -p 2222\n"
+            "- Prefer apt over snap on the Ubuntu hosts")
+
+        preview_label = QLabel(
+            "<b>What a new chat starts with</b> — notes plus a digest of your "
+            "most recent chats (set how many in Settings → Chat → Memory).")
+        preview_label.setWordWrap(True)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self._refresh_preview()
+
+        clear_btn = QPushButton("Clear chat history…")
+        clear_btn.clicked.connect(self._clear)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        row = QHBoxLayout()
+        row.addWidget(clear_btn)
+        row.addStretch(1)
+        row.addWidget(buttons)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(notes_label)
+        layout.addWidget(self.notes, 1)
+        layout.addWidget(preview_label)
+        layout.addWidget(self.preview, 2)
+        note = QLabel(f"Stored in {memory.chats_dir().parent}")
+        note.setStyleSheet("color:#9aa0a6;")
+        layout.addWidget(note)
+        layout.addLayout(row)
+
+    def _refresh_preview(self):
+        text = memory.memory_prompt(self._sessions, exclude=self._current)
+        if self._sessions <= 0:
+            text = "Memory is off. Turn it on in Settings → Chat → Memory."
+        self.preview.setPlainText(text or "Nothing remembered yet.")
+
+    def _save(self):
+        try:
+            memory.save_notes(self.notes.toPlainText())
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not save notes", str(exc))
+            return
+        self.accept()
+
+    def _clear(self):
+        if QMessageBox.question(
+                self, "Clear chat history?",
+                "Delete every saved chat? Saved notes are kept.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        n = memory.clear_history()
+        self.cleared = True
+        self._refresh_preview()
+        QMessageBox.information(self, "History cleared",
+                                f"Deleted {n} saved chat{'s' if n != 1 else ''}.")

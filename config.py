@@ -138,6 +138,15 @@ DEFAULTS = {
     # Most characters of conversation sent per request. Oldest turns are
     # dropped beyond it. Roughly 4 characters per token.
     "context_chars": 96000,
+    # Memory: how many recent chats a new chat is told about (0 = off).
+    "memory_sessions": 10,
+}
+
+MEMORY_LIMITS = {
+    0: "Off — every chat starts fresh",
+    3: "Last 3 chats",
+    10: "Last 10 chats — default",
+    25: "Last 25 chats",
 }
 
 CONTEXT_LIMITS = {
@@ -309,7 +318,19 @@ class SettingsDialog(QDialog):
             "max_model_len / num_ctx). Too large and some servers cut the "
             "request themselves, and the model replies with gibberish.")
 
+        self.memory = QComboBox()
+        for n, label in MEMORY_LIMITS.items():
+            self.memory.addItem(label, n)
+        idx = self.memory.findData(int(self.cfg.get("memory_sessions", 10)))
+        self.memory.setCurrentIndex(idx if idx >= 0 else 2)
+        self.memory.setToolTip(
+            "How many of your recent chats a new chat is told about: what was "
+            "asked, which commands ran and whether they worked, and how it "
+            "ended. Saved notes are always included unless this is Off.\n"
+            "Chats are always saved; reopen them from History.")
+
         cform.addRow("Auto-run limit", self.auto_steps)
+        cform.addRow("Memory", self.memory)
         cform.addRow("Output sent to AI", self.ai_output)
         cform.addRow("Context window", self.context)
 
@@ -414,6 +435,7 @@ class SettingsDialog(QDialog):
             "auto_run_max_steps": self.auto_steps.currentData(),
             "ai_output_chars": self.ai_output.currentData(),
             "context_chars": self.context.currentData(),
+            "memory_sessions": self.memory.currentData(),
             "shell": self.shell.currentText().strip(),
             "font_family": self.font_family.currentText().strip(),
             "font_size": self.font_size.value(),

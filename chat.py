@@ -1,6 +1,7 @@
 """The right-hand pane: conversation, composer, and the bridge to the shell."""
 
 from collections import Counter
+import hashlib
 import re
 import time
 
@@ -68,7 +69,11 @@ AGENT_RULES = (
     "Never guess at options: if a command fails because of "
     "a bad option or unknown command, check its --help once, then use only "
     "options you saw there. If the same thing fails twice, stop trying "
-    "variants. When the task is finished, or you cannot continue "
+    "variants. Never re-run a command whose output you already have: "
+    "the log of earlier steps is authoritative, so act on it. To wait for "
+    "something, use ONE command that loops until it is ready, with a "
+    "timeout (e.g. `timeout 120 sh -c 'until <check>; do sleep 5; done'`), "
+    "not the same check repeated. When the task is finished, or you cannot continue "
     "without me, reply starting with DONE and a short summary, and give no "
     "code block.")
 
@@ -128,6 +133,61 @@ def looks_failed(output: str) -> bool:
 
 def normalise_cmd(cmd: str) -> str:
     return " ".join(cmd.split()).lower()
+
+
+_DIGITS = re.compile(r"\d+")
+
+
+def output_signature(output: str) -> str:
+    """Fingerprint of an output that ignores what changes on every run.
+
+    Ages, timestamps, PIDs and byte counters differ between two runs of a
+    status check even when nothing happened, so digits are dropped. Two runs
+    of one command with the same signature mean no progress was made.
+    """
+    text = _DIGITS.sub("#", " ".join((output or "").split()).lower())
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+_KEY_LINE = re.compile(r"error|fail|denied|not found|no such|invalid|"
+                       r"cannot|unable|warning|active:|status", re.I)
+
+
+def summarize_output(output: str, limit: int = 160) -> str:
+    """One line for the step log: the first and last meaningful lines."""
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    if not lines:
+        return "(no output)"
+    picked = [lines[0]]
+    # The line that says what went wrong is usually neither first nor last.
+    key = next((ln for ln in lines[1:-1] if _KEY_LINE.search(ln)), None)
+    if key:
+        picked.append(key)
+    if len(lines) > 1:
+        picked.append(lines[-1])
+    text = " … ".join(picked)
+    if len(lines) > 2:
+        text += f"  [{len(lines)} lines]"
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _cycle_period(keys: list) -> int:
+    """Length of a cycle the tail of keys keeps repeating (A,B,A,B,A,B), or 0.
+
+    One step repeated is caught separately; this catches the model bouncing
+    between two or three commands that each give the same answer as before
+    (A,B,A,B or A,B,C,A,B,C).
+    """
+    for p in (2, 3):
+        reps = 2
+        if len(keys) < p * reps:
+            continue
+        tail = keys[-p * reps:]
+        unit = tail[-p:]
+        if len(set(unit)) == p and all(tail[i:i + p] == unit
+                                       for i in range(0, len(tail), p)):
+            return p
+    return 0
 
 
 def is_repeating(text: str) -> bool:
@@ -468,7 +528,8 @@ class ChatPanel(QWidget):
         self._wait_timer.timeout.connect(self._render)
         self._req_started = 0.0
         self._answer_started = 0.0
-        self._chain_log = []    # auto-run this chain: (command, failed)
+        self._chain_log = []    # auto-run steps: {cmd, key, sig, failed, result, summary}
+        self._nudged = set()    # commands already refused once this chain
         self._thinking = {}     # display index -> reasoning streamed separately
         self._think_secs = {}   # display index -> seconds spent thinking
 
@@ -504,7 +565,7 @@ class ChatPanel(QWidget):
         self.stop()
         self._cancel_auto_run()
         self._auto_chain = 0
-        self._chain_log = []
+        self._reset_chain()
         self.messages = []
         self._display_list = []
         self._thinking = {}
@@ -692,8 +753,8 @@ class ChatPanel(QWidget):
             self.chat_title = memory.title_from(text)
         self.input.clear()
         self._auto_chain = 0          # a typed message starts a fresh chain
-        self._chain_log = []
-        self._dispatch(payload, display, short=short)
+        self._reset_chain()
+        self._dispatch(payload, display, short=short, typed=True)
 
     def stop(self):
         if self.worker is not None:
@@ -932,7 +993,7 @@ class ChatPanel(QWidget):
             self.notice.emit("Auto-run armed — one command at a time, each "
                              "result read before the next")
             self._auto_chain = 0
-            self._chain_log = []
+            self._reset_chain()
             # Commands already on offer from the last reply: start with the
             # first of them now instead of waiting for another reply.
             if not self.streaming:
@@ -992,6 +1053,8 @@ class ChatPanel(QWidget):
         if lang not in SHELL_LANGS:
             self.notice.emit(f"Auto-run skipped — first block is {lang}, not shell")
             return
+        if self._refuse_repeat(block):
+            return
         if is_destructive(block):
             self.notice.emit("Auto-run held — this one looks destructive")
             self._run_selected()      # falls through to the usual confirmation
@@ -1000,6 +1063,38 @@ class ChatPanel(QWidget):
         self._countdown = self.AUTO_RUN_DELAY
         self._auto_tick_label()
         self._auto_timer.start(1000)
+
+    def _refuse_repeat(self, block: str) -> bool:
+        """Hold a command the chain has already run twice.
+
+        The first time, hand it back to the model with the earlier results;
+        if it proposes it yet again, stop auto-run. True when held.
+        """
+        key = normalise_cmd(block)
+        runs = [s for s in self._chain_log if s["key"] == key]
+        if len(runs) < 2:
+            return False
+        if key in self._nudged:
+            self.auto_run.setChecked(False)
+            self.notice.emit("Auto-run paused — the assistant keeps proposing "
+                             "a command it has already run")
+            return True
+        self._nudged.add(key)
+        self._clear_blocks()
+        seen = "\n".join(f"- step {s['step']}: {s['result']}: {s['summary']}"
+                         for s in runs)
+        payload = (
+            f"You proposed this command again:\n```\n{block}\n```\n"
+            f"It was NOT run. It has already run {len(runs)} times for this "
+            f"task:\n{seen}\n\nRunning it again will not tell you anything "
+            "new. Decide from the outputs you already have: give a different "
+            "next command, or reply DONE with a summary (or say what you need "
+            f"from me if you are stuck).\n\n{AGENT_RULES}")
+        display = (f"*(auto-run held `{clip(block, 80)}` — already run "
+                   f"{len(runs)} times; asked the assistant for a different step)*")
+        self.notice.emit("Auto-run held a repeated command")
+        self._dispatch(payload, display, agent=True)
+        return True
 
     def _auto_tick(self):
         self._countdown -= 1
@@ -1054,6 +1149,9 @@ class ChatPanel(QWidget):
                               "time": time.time()})
         self.save_chat()
         auto = self.auto_run.isChecked()
+        # Decided before auto-run can be switched off below: the model's answer
+        # to a stopped chain must still be built from the chain's state.
+        in_chain = auto
         if not (self.check_results.isChecked() or auto):
             return
         if self.streaming:
@@ -1079,27 +1177,23 @@ class ChatPanel(QWidget):
                 auto = False
 
         warn = ""
-        if auto:
-            failed = looks_failed(output)
-            key = normalise_cmd(command)
-            repeat = any(k == key for k, _ in self._chain_log)
-            self._chain_log.append((key, failed))
-            streak = 0
-            for _, f in reversed(self._chain_log):
-                if not f:
-                    break
-                streak += 1
-            if failed and (repeat or streak >= 3):
-                # Retrying the same thing, or guessing variant after variant:
-                # more steps will not help. Let the model explain, but stop.
-                why = ("the same command failed again" if repeat
-                       else f"{streak} commands in a row failed")
+        stopped = False
+        if in_chain:
+            # Logged even when the step did not finish, so the step log
+            # always ends with the command shown in full below.
+            why, warn = self._check_progress(command, output, status)
+            if not auto:
+                warn = ""
+            elif why:
+                # More steps will not help. Let the model explain, but stop.
                 self.auto_run.setChecked(False)
                 self.notice.emit(f"Auto-run paused — {why}")
                 auto = False
+                stopped = True
                 warn = (f"\n\nAuto-run has been stopped because {why}. Do not "
-                        "suggest another variant. Explain briefly what is going "
-                        "wrong and what you need from me.")
+                        "suggest another command. Explain briefly what the "
+                        "outputs show, what is going wrong and what you need "
+                        "from me.")
 
         step = (f"Step {self._auto_chain} of at most {self.max_steps}. "
                 if auto else "")
@@ -1119,14 +1213,17 @@ class ChatPanel(QWidget):
                 "mkdir or cp that normally means it succeeded."
                 if status not in ("timeout", "stalled") else
                 "Output: none so far.")
-        payload = (
-            f"{head}"
-            f"{body}{note}{warn}\n\n"
-            f"{step}Read the output and check the result against the goal. If "
-            "it failed, explain briefly and give the corrected command. If it "
-            "worked and steps remain, give only the next single command, chosen "
-            "from what this output shows. If the task is complete, reply DONE "
-            "with a short summary and give no code block.")
+        if stopped:
+            ask = ("Read the outputs and tell me what they show, without a "
+                   "code block.")
+        else:
+            ask = (f"{step}Read the output and check the result against the "
+                   "goal. If it failed, explain briefly and give the corrected "
+                   "command. If it worked and steps remain, give only the next "
+                   "single command, chosen from what this output shows. If the "
+                   "task is complete, reply DONE with a short summary and give "
+                   "no code block.")
+        payload = f"{head}{body}{note}{warn}\n\n{ask}"
         if auto:
             payload += f"\n\n{AGENT_RULES}"
 
@@ -1140,7 +1237,124 @@ class ChatPanel(QWidget):
             display += (f"\n*Preview only — "
                         f"{self._size_note(len(full_output), len(output) if cut else len(full_output))}.*")
 
-        self._dispatch(payload, display, short=short)
+        self._dispatch(payload, display, short=short, agent=in_chain)
+
+    def _check_progress(self, command: str, output: str, status: str):
+        """Log a step and decide whether the chain is still getting anywhere.
+
+        Returns (why, warn): why is set when auto-run must stop, warn is a
+        note for the model when it is starting to go round in circles. The
+        old check only looked at failures, so a command that succeeded but
+        was re-run forever (a status check, a cat, an ls) never stopped.
+        """
+        failed = looks_failed(output)
+        key, sig = normalise_cmd(command), output_signature(output)
+        earlier = [s for s in self._chain_log if s["key"] == key]
+        same = [s for s in earlier if s["sig"] == sig]
+        self._chain_log.append({
+            "cmd": command, "key": key, "sig": sig, "failed": failed,
+            "result": ("failed" if failed else
+                       "unfinished" if status in ("timeout", "stalled") else "ok"),
+            "summary": summarize_output(output),
+            "step": len(self._chain_log) + 1})
+        streak = 0
+        for s in reversed(self._chain_log):
+            if not s["failed"]:
+                break
+            streak += 1
+
+        if failed and earlier:
+            return "the same command failed again", ""
+        if streak >= 3:
+            return f"{streak} commands in a row failed", ""
+        if len(same) >= 2:
+            return (f"`{clip(command, 60)}` returned the same output "
+                    f"{len(same) + 1} times — no progress"), ""
+        period = _cycle_period([(s["key"], s["sig"]) for s in self._chain_log])
+        if period:
+            return (f"the last {period} commands keep repeating with the same "
+                    "results — it is going round in circles"), ""
+        if same:
+            steps = ", ".join(str(s["step"]) for s in same)
+            return "", (
+                f"\n\nNOTE: this exact command already ran at step {steps} "
+                "and gave the same output. Running it again will not change "
+                "anything. Act on what the output says: take a different next "
+                "step, or reply DONE if the goal is met or you are stuck.")
+        return "", ""
+
+    def _reset_chain(self):
+        self._chain_log = []
+        self._nudged = set()
+
+    # The parts of the step-by-step prompt, in characters.
+    GOAL_CHARS = 4000
+    BACKGROUND_CHARS = 3000
+    LOG_STEPS = 30
+    PREV_REPLY_CHARS = 1500
+
+    def _chain_goal(self) -> tuple:
+        """(goal, background): the request this chain works on, and what came
+        before it. The goal is the last message the user typed."""
+        idx = next((i for i in range(len(self.messages) - 1, -1, -1)
+                    if self.messages[i].get("typed")), None)
+        if idx is None:
+            idx = next((i for i, m in enumerate(self.messages)
+                        if m["role"] == "user"), None)
+        if idx is None:
+            return "", ""
+        goal = clip(self.messages[idx]["content"].replace(AGENT_RULES, "").strip(),
+                    self.GOAL_CHARS)
+        before, used = [], 0
+        for m in reversed(self.messages[:idx]):
+            text = clip(m.get("short", m["content"]).replace(AGENT_RULES, "").strip(), 600)
+            if used + len(text) > self.BACKGROUND_CHARS:
+                break
+            before.append(f"{'Me' if m['role'] == 'user' else 'You'}: {text}")
+            used += len(text)
+        return goal, "\n\n".join(reversed(before))
+
+    def _agent_request(self, latest: str) -> list:
+        """The request for one auto-run step, rebuilt from state every time.
+
+        Replaying the whole chat made each step longer than the last, until
+        the newest output was buried under (or, on servers that silently
+        truncate, cut away with) dozens of near-identical turns. The model
+        then answered an older turn and ran the same command again and
+        again. Instead every step sends a fixed-shape prompt: the goal, a
+        one-line-per-step log of what has run, the model's last note, and
+        the newest output in full, last, where it cannot be missed.
+        """
+        goal, background = self._chain_goal()
+        parts = ["[Auto-run step. This message is rebuilt every step from the "
+                 "task, the log of commands run so far, and the newest output. "
+                 "Base your answer on the NEWEST OUTPUT section.]"]
+        if goal:
+            parts.append(f"## Task (what I asked for)\n{goal}")
+        if background:
+            parts.append(f"## Earlier in our conversation (abridged)\n{background}")
+        # The newest step is shown in full below, so the log stops before it.
+        log = self._chain_log[:-1] if latest.startswith("I ran this") else self._chain_log
+        if log:
+            shown = log[-self.LOG_STEPS:]
+            lines = []
+            if len(log) > len(shown):
+                lines.append(f"(steps 1–{len(log) - len(shown)} not listed)")
+            counts = Counter(s["key"] for s in log)
+            for s in shown:
+                again = (f"  ← run {counts[s['key']]}× in total"
+                         if counts[s["key"]] > 1 else "")
+                lines.append(f"{s['step']}. `{clip(s['cmd'], 200)}` → "
+                             f"{s['result']}: {s['summary']}{again}")
+            parts.append("## Commands already run for this task (oldest first)\n"
+                         + "\n".join(lines))
+        prev = next((m["content"] for m in reversed(self.messages)
+                     if m["role"] == "assistant"), "")
+        if prev and log:
+            parts.append("## Your previous reply (abridged)\n"
+                         + clip(prev, self.PREV_REPLY_CHARS))
+        parts.append(f"## NEWEST OUTPUT\n{latest}")
+        return [{"role": "user", "content": "\n\n".join(parts)}]
 
     def _clear_blocks(self):
         """Drop the previous round's commands.
@@ -1193,12 +1407,20 @@ class ChatPanel(QWidget):
         self._last_trim = dropped
         return msgs
 
-    def _dispatch(self, payload: str, display: str, short: str = None):
-        """Append a user turn and start a request."""
+    def _dispatch(self, payload: str, display: str, short: str = None,
+                  typed: bool = False, agent: bool = False):
+        """Append a user turn and start a request.
+
+        agent: an auto-run step. The full turn still goes into the history
+        (for the transcript, saving and later questions), but the request is
+        the compact step prompt from _agent_request instead of the replay.
+        """
         self._clear_blocks()
         msg = {"role": "user", "content": payload}
         if short:
             msg["short"] = short
+        if typed:
+            msg["typed"] = True
         self.messages.append(msg)
         self._display.append(("user", display))
         self._display.append(("assistant", ""))
@@ -1211,7 +1433,8 @@ class ChatPanel(QWidget):
         self.stop_btn.setVisible(True)
         self._wait_timer.start(1000)
 
-        self.worker = ChatWorker(self._request_cfg(), self._api_messages(), self)
+        api = self._agent_request(payload) if agent else self._api_messages()
+        self.worker = ChatWorker(self._request_cfg(), api, self)
         self.worker.chunk.connect(self._on_chunk)
         self.worker.thinking.connect(self._on_thinking)
         self.worker.finished_ok.connect(self._on_done)

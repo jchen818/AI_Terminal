@@ -33,6 +33,24 @@ def _endpoint(cfg: dict) -> str:
     return f"{base}/chat/completions"
 
 
+def ollama_num_ctx(cfg: dict) -> int:
+    """Context window to ask Ollama for.
+
+    Ollama does not use the model's full window: it defaults to 2K-4K tokens
+    and silently cuts anything longer from the front of the prompt, so the
+    task, the rules and the earlier steps vanish while the app thinks it sent
+    them. Size it to the app's own context setting instead (about 3
+    characters per token for terminal output) plus room for the reply.
+    "ollama_num_ctx" in the config overrides it.
+    """
+    fixed = int(cfg.get("ollama_num_ctx", 0) or 0)
+    if fixed > 0:
+        return fixed
+    chars = int(cfg.get("context_chars", 96000)) + len(cfg.get("system_prompt", ""))
+    tokens = chars // 3 + max(4096, int(cfg.get("max_tokens", 2048)))
+    return max(8192, -(-tokens // 2048) * 2048)
+
+
 def _payload(cfg: dict, messages: list, stream: bool) -> dict:
     style = cfg.get("api_style", "openai")
     system = cfg.get("system_prompt", "").strip()
@@ -60,6 +78,7 @@ def _payload(cfg: dict, messages: list, stream: bool) -> dict:
                 # Ollama otherwise generates without limit, so a model stuck
                 # in a loop never ends. Generous, since thinking counts too.
                 "num_predict": max(8192, 4 * int(cfg.get("max_tokens", 2048))),
+                "num_ctx": ollama_num_ctx(cfg),
             },
         }
     return {

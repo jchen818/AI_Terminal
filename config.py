@@ -138,6 +138,9 @@ DEFAULTS = {
     # Most characters of conversation sent per request. Oldest turns are
     # dropped beyond it. Roughly 4 characters per token.
     "context_chars": 96000,
+    # Ollama only: context window (num_ctx) requested per call. 0 = sized
+    # from context_chars, since Ollama's own 2K-4K default cuts long chats.
+    "ollama_num_ctx": 0,
     # Memory: how many recent chats a new chat is told about (0 = off).
     "memory_sessions": 10,
 }

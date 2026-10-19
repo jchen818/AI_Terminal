@@ -4,11 +4,13 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QVBoxLayout,
+    QAbstractSpinBox, QFrame, QPushButton, QScrollArea, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 APP_NAME = "AI Terminal"
@@ -203,6 +205,16 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, fh, indent=2)
 
 
+class _WheelGuard(QObject):
+    """Pass wheel events on unfocused inputs to the scroll area instead."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and not obj.hasFocus():
+            event.ignore()
+            return True
+        return False
+
+
 class SettingsDialog(QDialog):
     """Everything the app needs to reach a model, plus terminal appearance."""
 
@@ -385,16 +397,48 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(ai_box)
-        layout.addWidget(window_box)
-        layout.addWidget(chat_box)
-        layout.addWidget(term_box)
+        # The groups scroll; the note and Save/Cancel stay pinned below them,
+        # so Save is reachable however tall the dialog gets (large fonts,
+        # small or scaled screens).
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 6, 0)
+        for box in (ai_box, window_box, chat_box, term_box):
+            body_layout.addWidget(box)
+        body_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(body)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # Turning the wheel over a dropdown or number box while scrolling
+        # would change its value; only let it do that once it has focus.
+        self._wheel_guard = _WheelGuard(self)
+        for w in body.findChildren(QWidget):
+            if isinstance(w, (QComboBox, QAbstractSpinBox)):
+                w.setFocusPolicy(Qt.StrongFocus)
+                w.installEventFilter(self._wheel_guard)
+
         note = QLabel(f"Saved to {config_path()} — the API key is stored in plain text.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#9aa0a6;")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(scroll, 1)
         layout.addWidget(note)
         layout.addWidget(buttons)
+
+        # Open at the content's natural height, but never taller than the
+        # screen's usable area (taskbar excluded).
+        screen = (parent.screen() if parent is not None else None) or \
+            QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry().height() if screen else 900
+        want = (body.sizeHint().height() + note.sizeHint().height()
+                + buttons.sizeHint().height() + 60)
+        self.resize(max(self.minimumWidth(), body.sizeHint().width() + 40),
+                    min(want, int(avail * 0.9)))
 
     @staticmethod
     def _wrap(layout):

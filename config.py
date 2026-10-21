@@ -145,7 +145,51 @@ DEFAULTS = {
     "ollama_num_ctx": 0,
     # Memory: how many recent chats a new chat is told about (0 = off).
     "memory_sessions": 10,
+    # MCP servers, in Claude Desktop's shape: {name: {command, args, env} or
+    # {url, headers, type}}. "disabled": true keeps an entry without using it.
+    "mcp_servers": {},
+    # How tools are offered: auto | native | text | off. See ai_client.
+    "tool_mode": "auto",
+    # Most tool calls in a row before control comes back to you.
+    "mcp_max_rounds": 10,
+    "mcp_tool_timeout_s": 120,
+    # Per tool ("server__tool"): allow | ask | never. Unlisted tools ask,
+    # except ones their server marks read-only, which are allowed.
+    "mcp_tool_policy": {},
 }
+
+TOOL_MODES = {
+    "auto": "Auto — native tool calls, text protocol if the server refuses",
+    "native": "Native only — needs a model and server with tool calling",
+    "text": "Text protocol only — works with any model",
+    "off": "Off — don't offer tools to the model",
+}
+
+TOOL_ROUND_LIMITS = {
+    5: "5 calls",
+    10: "10 calls — default",
+    20: "20 calls",
+    40: "40 calls — long jobs",
+}
+
+TOOL_TIMEOUTS = {
+    30: "30 seconds",
+    120: "2 minutes — default",
+    600: "10 minutes — slow tools",
+}
+
+MCP_EXAMPLE = """{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]
+    },
+    "remote": {
+      "url": "http://10.0.0.5:8000/mcp",
+      "headers": {"Authorization": "Bearer ..."}
+    }
+  }
+}"""
 
 MEMORY_LIMITS = {
     0: "Off — every chat starts fresh",
@@ -393,6 +437,72 @@ class SettingsDialog(QDialog):
                                 "nothing is selected."))
         tform.addRow("", QLabel("Shell and scrollback apply to new terminal sessions."))
 
+        # --- MCP tools ---------------------------------------------------
+        mcp_box = QGroupBox("MCP tools")
+        mform = QFormLayout(mcp_box)
+
+        self.tool_mode = QComboBox()
+        for key, label in TOOL_MODES.items():
+            self.tool_mode.addItem(label, key)
+        idx = self.tool_mode.findData(self.cfg.get("tool_mode", "auto"))
+        self.tool_mode.setCurrentIndex(idx if idx >= 0 else 0)
+        self.tool_mode.setToolTip(
+            "Native: the tool list goes in the request and the model returns "
+            "structured calls. vLLM needs --enable-auto-tool-choice "
+            "--tool-call-parser for this.\n"
+            "Text: the tools are described in the system prompt and the model "
+            "writes a ```tool block, which the app runs. Works with any model, "
+            "a little less reliably.")
+
+        self.tool_rounds = QComboBox()
+        for n, label in TOOL_ROUND_LIMITS.items():
+            self.tool_rounds.addItem(label, n)
+        idx = self.tool_rounds.findData(int(self.cfg.get("mcp_max_rounds", 10)))
+        self.tool_rounds.setCurrentIndex(idx if idx >= 0 else 1)
+        self.tool_rounds.setToolTip(
+            "Most tool calls the assistant may make in a row for one message "
+            "before it has to answer.")
+
+        self.tool_timeout = QComboBox()
+        for n, label in TOOL_TIMEOUTS.items():
+            self.tool_timeout.addItem(label, n)
+        idx = self.tool_timeout.findData(int(self.cfg.get("mcp_tool_timeout_s", 120)))
+        self.tool_timeout.setCurrentIndex(idx if idx >= 0 else 1)
+
+        from mcp_client import servers_text
+        self.mcp_servers = QPlainTextEdit(
+            servers_text(self.cfg.get("mcp_servers", {}))
+            if self.cfg.get("mcp_servers") else "")
+        self.mcp_servers.setPlaceholderText(MCP_EXAMPLE)
+        mono = self.mcp_servers.font()
+        mono.setFamily("Consolas")
+        mono.setStyleHint(mono.StyleHint.Monospace)
+        self.mcp_servers.setFont(mono)
+        self.mcp_servers.setFixedHeight(170)
+        self.mcp_servers.setToolTip(
+            "Same format as Claude Desktop's claude_desktop_config.json — paste "
+            "its \"mcpServers\" section as is.\n"
+            "Local server: \"command\", \"args\", optional \"env\" and \"cwd\".\n"
+            "Remote server: \"url\" (Streamable HTTP), optional \"headers\"; "
+            "add \"type\": \"sse\" for older SSE servers.\n"
+            "\"disabled\": true keeps an entry without starting it.")
+        check_btn = QPushButton("Check format")
+        check_btn.clicked.connect(self._check_servers)
+        self.mcp_result = QLabel(self._mcp_status(parent))
+        self.mcp_result.setWordWrap(True)
+        self.mcp_result.setStyleSheet("color:#9aa0a6;")
+        check_row = QHBoxLayout()
+        check_row.addWidget(check_btn)
+        check_row.addWidget(self.mcp_result, 1)
+
+        mform.addRow("Tool calls", self.tool_mode)
+        mform.addRow("Calls per message", self.tool_rounds)
+        mform.addRow("Tool timeout", self.tool_timeout)
+        mform.addRow("Servers", self.mcp_servers)
+        mform.addRow("", self._wrap(check_row))
+        mform.addRow("", QLabel("Per-tool permissions are in the Tools menu above "
+                                "the chat."))
+
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -403,7 +513,7 @@ class SettingsDialog(QDialog):
         body = QWidget()
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 6, 0)
-        for box in (ai_box, window_box, chat_box, term_box):
+        for box in (ai_box, window_box, chat_box, mcp_box, term_box):
             body_layout.addWidget(box)
         body_layout.addStretch(1)
 
@@ -465,9 +575,54 @@ class SettingsDialog(QDialog):
         self.test_result.setStyleSheet(
             "color:#4caf50;" if ok else "color:#e57373;")
 
+    @staticmethod
+    def _mcp_status(parent) -> str:
+        mgr = getattr(parent, "mcp", None)
+        if mgr is None:
+            return ""
+        lines = []
+        for s in mgr.states():
+            if s.status == "ready":
+                lines.append(f"{s.name}: connected, {len(s.tools)} tools")
+            elif s.status == "error":
+                lines.append(f"{s.name}: failed — {s.error}")
+            else:
+                lines.append(f"{s.name}: {s.status}")
+        return "\n".join(lines)
+
+    def _servers(self):
+        """(servers, error) from the editor."""
+        from mcp_client import parse_servers
+        try:
+            return parse_servers(self.mcp_servers.toPlainText()), ""
+        except ValueError as exc:
+            return None, str(exc)
+
+    def _check_servers(self):
+        servers, err = self._servers()
+        if err:
+            self.mcp_result.setText(err)
+            self.mcp_result.setStyleSheet("color:#e57373;")
+            return
+        on = [n for n, s in servers.items() if not s.get("disabled")]
+        self.mcp_result.setText(
+            f"Format OK — {len(servers)} server{'s' if len(servers) != 1 else ''}"
+            f" ({len(on)} enabled). They connect when you press Save."
+            if servers else "No servers — tools are off.")
+        self.mcp_result.setStyleSheet("color:#4caf50;")
+
+    def accept(self):
+        _, err = self._servers()
+        if err:
+            QMessageBox.warning(self, "MCP servers", f"The server list has a "
+                                f"problem, so nothing was saved:\n\n{err}")
+            return
+        super().accept()
+
     def values(self) -> dict:
         pid = self.provider.currentData()
         cfg = dict(self.cfg)
+        servers, _ = self._servers()
         cfg.update({
             "provider": pid,
             "api_style": PROVIDERS[pid]["api"],
@@ -483,6 +638,11 @@ class SettingsDialog(QDialog):
             "ai_output_chars": self.ai_output.currentData(),
             "context_chars": self.context.currentData(),
             "memory_sessions": self.memory.currentData(),
+            "tool_mode": self.tool_mode.currentData(),
+            "mcp_max_rounds": self.tool_rounds.currentData(),
+            "mcp_tool_timeout_s": self.tool_timeout.currentData(),
+            "mcp_servers": servers if servers is not None
+            else self.cfg.get("mcp_servers", {}),
             "shell": self.shell.currentText().strip(),
             "font_family": self.font_family.currentText().strip(),
             "font_size": self.font_size.value(),

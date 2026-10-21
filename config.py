@@ -187,6 +187,11 @@ MCP_EXAMPLE = """{
     "remote": {
       "url": "http://10.0.0.5:8000/mcp",
       "headers": {"Authorization": "Bearer ..."}
+    },
+    "mcpo": {
+      "type": "openapi",
+      "url": "http://10.0.0.5:8000",
+      "headers": {"Authorization": "Bearer ${MCPO_API_KEY}"}
     }
   }
 }"""
@@ -485,6 +490,9 @@ class SettingsDialog(QDialog):
             "Local server: \"command\", \"args\", optional \"env\" and \"cwd\".\n"
             "Remote server: \"url\" (Streamable HTTP), optional \"headers\"; "
             "add \"type\": \"sse\" for older SSE servers.\n"
+            "mcpo / any OpenAPI server: \"type\": \"openapi\" and its \"url\" — "
+            "the mcpo root picks up every server behind it. ${VAR} in a url or "
+            "header is read from the environment.\n"
             "\"disabled\": true keeps an entry without starting it.")
         check_btn = QPushButton("Check format")
         check_btn.clicked.connect(self._check_servers)

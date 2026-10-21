@@ -105,6 +105,26 @@ Claude Desktop uses, so its `mcpServers` section can be pasted in as is:
 }
 ```
 
+**Servers behind mcpo.** [mcpo](https://github.com/open-webui/mcpo) turns MCP
+servers into a REST API for Open WebUI, so it does not speak MCP itself. Add it with
+`"type": "openapi"` instead: the app reads its `openapi.json` and offers each
+endpoint as a tool. Point `url` at the mcpo root to pick up every server it runs
+(tools are named `<server>_<tool>`), or at one server (`…:8000/searxng`).
+`${VAR}` in a url or header is read from the environment, so the key can stay out
+of the config file:
+
+```json
+{
+  "mcpServers": {
+    "mcpo": {
+      "type": "openapi",
+      "url": "http://10.46.252.18:8000",
+      "headers": { "Authorization": "Bearer ${MCPO_API_KEY}" }
+    }
+  }
+}
+```
+
 Local servers start as child processes; their stderr goes to
 `%APPDATA%\AITerminal\mcp-<name>.log`. Remote servers use Streamable HTTP, or SSE
 with `"type": "sse"`. Servers connect in the background when the app starts and
@@ -209,6 +229,7 @@ chat.py        transcript, composer, code-block runner
 ai_client.py   streaming clients for OpenAI / Anthropic / Ollama wire formats,
                native and text-protocol tool calls
 mcp_client.py  MCP server connections on a background asyncio thread
+openapi_tools.py  OpenAPI servers (mcpo) as tools
 memory.py      saved chats and the memory digest
 config.py      config file and settings dialog
 ```

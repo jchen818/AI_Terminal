@@ -14,8 +14,13 @@ entries can be pasted in:
         "filesystem": {"command": "npx",
                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]},
         "remote":     {"url": "http://10.0.0.5:8000/mcp", "headers": {"Authorization": "Bearer …"}},
-        "old":        {"url": "http://host:9000/sse", "type": "sse", "disabled": true}
+        "old":        {"url": "http://host:9000/sse", "type": "sse", "disabled": true},
+        "mcpo":       {"url": "http://10.0.0.5:8000", "type": "openapi",
+                       "headers": {"Authorization": "Bearer ${MCPO_API_KEY}"}}
     }}
+
+"type": "openapi" reads a REST API's openapi.json instead of speaking MCP —
+see openapi_tools.py; that is how servers behind mcpo are reached.
 """
 
 import asyncio
@@ -29,7 +34,9 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Signal
 
+import openapi_tools
 from config import config_dir
+from openapi_tools import is_openapi
 
 try:  # The SDK needs Python 3.10+; without it the rest of the app still works.
     from mcp import ClientSession, StdioServerParameters
@@ -68,6 +75,8 @@ def parse_servers(text: str) -> dict:
         if not spec.get("command") and not spec.get("url"):
             raise ValueError(f"Server “{name}” needs a \"command\" (local) "
                              "or a \"url\" (remote).")
+        if is_openapi(spec) and not spec.get("url"):
+            raise ValueError(f"Server “{name}”: an OpenAPI server needs a \"url\".")
         if "args" in spec and not isinstance(spec["args"], list):
             raise ValueError(f"Server “{name}”: \"args\" must be a list.")
         for key in ("env", "headers"):
@@ -98,6 +107,7 @@ class ToolInfo:
     schema: dict
     read_only: bool = False   # server says it changes nothing
     destructive: bool = False # server says it may destroy data
+    endpoint: dict = None     # set for OpenAPI tools: how to call over HTTP
 
 
 @dataclass
@@ -192,13 +202,6 @@ class MCPManager(QObject):
     def configure(self, servers: dict, force: bool = False):
         """Connect to servers; reconnect only those whose spec changed."""
         servers = servers or {}
-        if not self.available:
-            with self._lock:
-                self._states = {n: ServerState(n, "error", "The mcp package is "
-                                               f"not usable: {MCP_IMPORT_ERROR}")
-                                for n in servers}
-            self.changed.emit()
-            return
         self._ensure_loop()
         old = self._specs
         self._specs = {n: dict(s) for n, s in servers.items()}
@@ -210,6 +213,13 @@ class MCPManager(QObject):
                 self._stop_server(name)
                 with self._lock:
                     self._states[name] = ServerState(name, "disabled")
+                continue
+            if not self.available and not is_openapi(spec):
+                self._stop_server(name)
+                with self._lock:
+                    self._states[name] = ServerState(
+                        name, "error", "The mcp package is not usable (it needs "
+                        f"Python 3.10+): {MCP_IMPORT_ERROR}")
                 continue
             running = name in self._tasks and not self._tasks[name].done()
             if force or not running or old.get(name) != spec:
@@ -276,6 +286,8 @@ class MCPManager(QObject):
         tool = self.find(key)
         if tool is None:
             return f"Unknown tool “{key}”, or its server is not connected.", True
+        if tool.endpoint:
+            return openapi_tools.call(tool, arguments, timeout)
         with self._lock:
             session = self._states[tool.server].session
         if session is None:
@@ -333,6 +345,9 @@ class MCPManager(QObject):
         self.changed.emit()
 
     async def _serve(self, name, spec, stop):
+        if is_openapi(spec):
+            await self._serve_openapi(name, spec, stop)
+            return
         log = None
         try:
             async with contextlib.AsyncExitStack() as stack:
@@ -357,6 +372,29 @@ class MCPManager(QObject):
         except BaseException as exc:  # noqa: BLE001 - incl. ExceptionGroup
             self._set(name, stop, status="error", error=_explain(exc, name),
                       session=None, tools=[])
+            return
+        self._set(name, stop, status="off", session=None, tools=[])
+
+    async def _serve_openapi(self, name, spec, stop):
+        """An OpenAPI server has no session to hold open: read its spec once,
+        then calls are plain HTTP requests."""
+        loop = asyncio.get_running_loop()
+        try:
+            tools = await loop.run_in_executor(
+                None, openapi_tools.load_tools, name, spec)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            if "Connection" in type(exc).__name__ or "Max retries" in text:
+                text = f"Could not reach {spec.get('url')}."
+            self._set(name, stop, status="error", error=text[:400], tools=[])
+            return
+        self._set(name, stop, status="ready", error="", tools=tools,
+                  session="openapi")
+        try:
+            await stop.wait()
+        except asyncio.CancelledError:
             return
         self._set(name, stop, status="off", session=None, tools=[])
 

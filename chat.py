@@ -2,12 +2,13 @@
 
 from collections import Counter
 import hashlib
+import json
 import re
 import time
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import (QFont, QGuiApplication, QKeySequence, QShortcut,
-                           QTextDocument)
+from PySide6.QtCore import QThread, Qt, QTimer, Signal
+from PySide6.QtGui import (QActionGroup, QFont, QGuiApplication, QKeySequence,
+                           QShortcut, QTextDocument)
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QTextBrowser, QVBoxLayout,
@@ -15,7 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 import memory
-from ai_client import ChatWorker
+from ai_client import (TOOL_BLOCK, TOOL_FENCE, ChatWorker, parse_text_tool_call,
+                       strip_tool_blocks, text_tool_prompt)
+from config import TOOL_MODES, save_config
 
 CODE_BLOCK = re.compile(r"```([\w+-]*)[ \t]*\n(.*?)```", re.DOTALL)
 
@@ -316,6 +319,55 @@ def is_script(block: str) -> bool:
     return False
 
 
+def _msg_chars(m: dict) -> int:
+    n = len(m.get("content") or "")
+    for c in m.get("tool_calls") or []:
+        n += len(c.get("name", "")) + len(json.dumps(c.get("arguments") or {}))
+    return n
+
+
+class ToolWorker(QThread):
+    """Runs approved MCP tool calls one after another, off the GUI thread."""
+
+    result = Signal(str, str, bool)   # call id, text, is_error
+
+    def __init__(self, manager, jobs, timeout, parent=None):
+        super().__init__(parent)
+        self.manager, self.jobs, self.timeout = manager, jobs, timeout
+        self._stop = False
+
+    def cancel(self):
+        # A call already sent finishes (or times out) on its own; nothing
+        # after it is started.
+        self._stop = True
+
+    def run(self):
+        for call, tool in self.jobs:
+            if self._stop:
+                return
+            text, is_error = self.manager.call(tool.key, call["arguments"],
+                                               self.timeout)
+            if self._stop:
+                return
+            self.result.emit(call["id"], text, is_error)
+
+
+def tool_policy(cfg: dict, tool) -> str:
+    """allow | ask | never. Tools their server marks read-only default to
+    allow; everything else asks until told otherwise."""
+    chosen = (cfg.get("mcp_tool_policy") or {}).get(tool.key)
+    if chosen in ("allow", "ask", "never"):
+        return chosen
+    return "allow" if tool.read_only and not tool.destructive else "ask"
+
+
+def _pretty_args(args) -> str:
+    try:
+        return json.dumps(args or {}, indent=1, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(args)
+
+
 class QuickEditView(QTextBrowser):
     """Read-only transcript. Right-click copies a selection, else asks to paste."""
 
@@ -396,13 +448,21 @@ class ChatPanel(QWidget):
     open_settings = Signal()
     notice = Signal(str)
 
-    def __init__(self, cfg: dict, terminal, parent=None):
+    def __init__(self, cfg: dict, terminal, mcp=None, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.terminal = terminal
+        self.mcp = mcp            # MCPManager, or None without MCP
         self.messages = []        # [{role, content}] sent to the API
         self.worker = None
         self.streaming = False
+        self._retired = []        # cancelled threads, kept until they end
+        self._agent_turn = False  # the request in flight is an auto-run step
+        # Tool calls in progress: the round being run and its results so far.
+        self._tool_worker = None
+        self._tools_busy = False
+        self._tool_round = None   # {calls, results, display_index, over}
+        self._text_only = set()   # (base_url, model) that refused native tools
 
         # --- header ------------------------------------------------------
         self.model_label = QLabel()
@@ -422,9 +482,18 @@ class ChatPanel(QWidget):
         self.history_menu.aboutToShow.connect(self._fill_history_menu)
         self.history_btn.setMenu(self.history_menu)
 
+        self.tools_btn = QPushButton("Tools")
+        self.tools_btn.setMinimumWidth(80)
+        self.tools_menu = QMenu(self)
+        self.tools_menu.aboutToShow.connect(self._fill_tools_menu)
+        self.tools_btn.setMenu(self.tools_menu)
+        if self.mcp is not None:
+            self.mcp.changed.connect(self._update_tools_button)
+
         header = QHBoxLayout()
         header.addWidget(QLabel("Assistant"))
         header.addWidget(self.model_label, 1)
+        header.addWidget(self.tools_btn)
         header.addWidget(self.history_btn)
         header.addWidget(new_btn)
         header.addWidget(settings_btn)
@@ -553,6 +622,7 @@ class ChatPanel(QWidget):
         self.model_label.setText(f"{label} · {model}")
         self.apply_font(int(cfg.get("chat_font_size", 10)))
         self._load_memory()
+        self._update_tools_button()
 
     def apply_font(self, size: int):
         font = QFont(self.view.font())
@@ -563,6 +633,7 @@ class ChatPanel(QWidget):
 
     def _reset_state(self):
         self.stop()
+        self._agent_turn = False
         self._cancel_auto_run()
         self._auto_chain = 0
         self._reset_chain()
@@ -712,7 +783,7 @@ class ChatPanel(QWidget):
     # -------------------------------------------------------------- send
 
     def send(self):
-        if self.streaming:
+        if self.streaming or self._tools_busy:
             return
         self._cancel_auto_run()
         text = self.input.toPlainText().strip()
@@ -758,29 +829,36 @@ class ChatPanel(QWidget):
 
     def stop(self):
         if self.worker is not None:
-            self.worker.cancel()
-            self.worker.wait(1500)
+            self._retire(self.worker)
             self.worker = None
+        self._cancel_tools()
         self.streaming = False
         self._wait_timer.stop()
         self.send_btn.setVisible(True)
         self.stop_btn.setVisible(False)
 
     def _on_chunk(self, text: str):
-        if not self.streaming:
+        if not self.streaming or self._stale(self.worker):
             return
         role, current = self._display[-1]
         self._display[-1] = (role, current + text)
         if is_repeating(current + text):
             self._abort_runaway()
             return
-        if not self._answer_started and split_thinking(current + text)[1]:
+        answer = split_thinking(current + text)[1]
+        if not self._answer_started and answer:
             self._answer_started = time.monotonic()
+        # Text protocol: the reply is over once a tool block is closed. Models
+        # often carry on and invent the tool's result; stop them first.
+        if (self.worker is not None and self.worker.mode_used == "text"
+                and TOOL_BLOCK.search(answer)):
+            self._finish_early()
+            return
         if not self.render_timer.isActive():
             self.render_timer.start(90)
 
     def _on_thinking(self, text: str):
-        if not self.streaming:
+        if not self.streaming or self._stale(self.worker):
             return
         i = len(self._display) - 1
         self._thinking[i] = self._thinking.get(i, "") + text
@@ -821,7 +899,17 @@ class ChatPanel(QWidget):
         self.save_chat()
         self._render()
 
+    def _finish_early(self):
+        """End a text-protocol reply at its tool block. Called from _on_chunk,
+        so _on_done sees this worker's chunk as the sender and accepts it."""
+        self._on_done()
+
     def _on_done(self):
+        if not self.streaming or self._stale(self.worker):
+            return
+        worker = self.worker
+        mode = getattr(worker, "mode_used", "off") if worker else "off"
+        calls = list(getattr(worker, "tool_calls", []) or []) if worker else []
         role, raw = self._display[-1]
         i = len(self._display) - 1
         if self._req_started and (self._thinking.get(i) or
@@ -830,7 +918,18 @@ class ChatPanel(QWidget):
             self._think_secs[i] = end - self._req_started
         # Only the answer counts. Thinking is neither sent back to the model
         # nor searched for commands to run.
-        content = split_thinking(raw)[1]
+        inline, content = split_thinking(raw)
+        if mode != "off":
+            if not calls:
+                # The text protocol, or a model leaking <tool_call> tags
+                # because the server is not parsing them for it.
+                content, call = parse_text_tool_call(content)
+                if call:
+                    calls = [call]
+            content = strip_tool_blocks(content)
+        if calls:
+            self._on_tool_reply(role, inline, content, calls)
+            return
         if not content.strip():
             self._display[-1] = (role, raw if raw.strip() else "*(empty response)*")
         else:
@@ -852,6 +951,8 @@ class ChatPanel(QWidget):
         self.input.setFocus()
 
     def _on_failed(self, message: str):
+        if self._tools_busy or not self.streaming or self._stale(self.worker):
+            return
         role, content = self._display[-1]
         self._display[-1] = (role, content + f"\n\n**Request failed.** {message}")
         self._render()
@@ -902,6 +1003,8 @@ class ChatPanel(QWidget):
         for i, (role, content) in enumerate(self._display):
             if role == "user":
                 parts.append(f"**You**\n\n{content or '…'}")
+            elif role == "tool":
+                parts.append(content)
             else:
                 parts.append(f"**Assistant**\n\n{self._assistant_block(i, content)}")
 
@@ -934,7 +1037,7 @@ class ChatPanel(QWidget):
         found = False
         for lang, body in CODE_BLOCK.findall(content):
             block = body.strip("\n").rstrip()
-            if not block:
+            if not block or lang.lower() == TOOL_FENCE:
                 continue
 
             if is_script(block):
@@ -1154,7 +1257,7 @@ class ChatPanel(QWidget):
         in_chain = auto
         if not (self.check_results.isChecked() or auto):
             return
-        if self.streaming:
+        if self.streaming or self._tools_busy:
             self.notice.emit("Command finished while a reply was in flight")
             return
 
@@ -1381,16 +1484,18 @@ class ChatPanel(QWidget):
         cleanly: some servers silently cut the start (including the chat
         template) and the model answers with gibberish.
         """
-        results = [i for i, m in enumerate(self.messages) if "short" in m]
+        # Tool results of the round in progress are always sent whole.
+        last_user = max((i for i, m in enumerate(self.messages)
+                         if m["role"] == "user"), default=-1)
+        results = [i for i, m in enumerate(self.messages)
+                   if "short" in m and not (m["role"] == "tool" and i > last_user)]
         old = set(results[:-self.KEEP_FULL_RESULTS])
-        msgs = [{"role": m["role"],
-                 "content": m["short"] if i in old else m["content"]}
-                for i, m in enumerate(self.messages)]
+        msgs = [self._api_view(m, i in old) for i, m in enumerate(self.messages)]
 
         budget = (self.context_budget - len(self.cfg.get("system_prompt", ""))
-                  - len(self._memory))
+                  - len(self._memory) - self._tools_prompt_chars())
         dropped = 0
-        while len(msgs) > 1 and sum(len(m["content"]) for m in msgs) > budget:
+        while len(msgs) > 1 and sum(_msg_chars(m) for m in msgs) > budget:
             msgs.pop(0)
             dropped += 1
             # A conversation must start with a user turn.
@@ -1433,13 +1538,388 @@ class ChatPanel(QWidget):
         self.stop_btn.setVisible(True)
         self._wait_timer.start(1000)
 
+        self._agent_turn = agent
         api = self._agent_request(payload) if agent else self._api_messages()
-        self.worker = ChatWorker(self._request_cfg(), api, self)
+        self._start_worker(api)
+
+    def _start_worker(self, api: list, no_tools: bool = False):
+        mode = "off" if no_tools else self._tool_mode()
+        tools = self._offered_tools() if mode != "off" else []
+        self.worker = ChatWorker(self._request_cfg(), api, self,
+                                 tools=tools, tool_mode=mode)
         self.worker.chunk.connect(self._on_chunk)
         self.worker.thinking.connect(self._on_thinking)
         self.worker.finished_ok.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
+        self.worker.fell_back.connect(self._on_fell_back)
         self.worker.start()
+
+    def _stale(self, current) -> bool:
+        """True when a signal comes from a thread that has been replaced or
+        cancelled. Its events can still be queued after it was let go."""
+        sender = self.sender()
+        return sender is not None and sender is not current
+
+    def _retire(self, worker):
+        """Cancel a thread and keep it referenced until it really ends;
+        dropping the last reference to a running QThread crashes Qt. Its
+        queued signals are ignored by _stale()."""
+        worker.cancel()
+        if worker.wait(300):
+            return
+        self._retired.append(worker)
+        worker.finished.connect(
+            lambda w=worker: self._retired.remove(w) if w in self._retired else None)
+
+    # ------------------------------------------------------------ MCP tools
+
+    def _tool_mode(self) -> str:
+        """How tools are offered on the next request: native | text | auto | off."""
+        mode = self.cfg.get("tool_mode", "auto")
+        if mode not in TOOL_MODES or self.mcp is None or not self._offered_tools():
+            return "off"
+        if mode == "auto" and self._model_key() in self._text_only:
+            return "text"
+        return mode
+
+    def _model_key(self):
+        return (self.cfg.get("base_url", ""), self.cfg.get("model", ""))
+
+    def _offered_tools(self) -> list:
+        if self.mcp is None or self.cfg.get("tool_mode", "auto") == "off":
+            return []
+        return [t for t in self.mcp.tools() if tool_policy(self.cfg, t) != "never"]
+
+    def _tools_prompt_chars(self) -> int:
+        tools = self._offered_tools() if self._tool_mode() != "off" else []
+        return len(text_tool_prompt(tools)) if tools else 0
+
+    @staticmethod
+    def _api_view(m: dict, use_short: bool) -> dict:
+        """A history entry as sent: the neutral fields only."""
+        out = {"role": m["role"],
+               "content": m["short"] if use_short and "short" in m else m["content"]}
+        for key in ("tool_calls", "tool_call_id", "name", "is_error"):
+            if key in m:
+                out[key] = m[key]
+        return out
+
+    def _on_fell_back(self, reason: str):
+        if self._stale(self.worker):
+            return
+        self._text_only.add(self._model_key())
+        self.notice.emit("The server refused native tool calls — using the text "
+                         "protocol for this model")
+        self._update_tools_button()
+
+    def _on_tool_reply(self, role, inline, content, calls):
+        """The model asked for tools: record the request, then run them."""
+        shown = (f"<think>{inline}</think>" if inline else "") + (
+            content or "*(calls a tool)*")
+        self._display[-1] = (role, shown)
+        self.messages.append({
+            "role": "assistant", "content": content,
+            "tool_calls": [{"id": c["id"], "name": c["name"],
+                            "arguments": c.get("arguments") or {}} for c in calls]})
+        saved = memory.add_notes(content)
+        if saved:
+            self.notice.emit("Remembered: " + "; ".join(saved)[:120])
+        self.streaming = False
+        self.stop()
+        self._start_tools(calls)
+
+    def _rounds_this_turn(self) -> int:
+        n = 0
+        for m in reversed(self.messages):
+            if m["role"] == "user":
+                break
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                n += 1
+        return n
+
+    def _start_tools(self, calls: list):
+        limit = max(1, int(self.cfg.get("mcp_max_rounds", 10)))
+        over = self._rounds_this_turn() > limit
+        self._tools_busy = True
+        self.send_btn.setVisible(False)
+        self.stop_btn.setVisible(True)
+        self._display.append(("tool", ""))
+        self._tool_round = {"calls": calls, "results": {}, "over": over,
+                            "index": len(self._display) - 1, "cancelled": False}
+        results = self._tool_round["results"]
+        self._render_tools(follow=True)
+
+        jobs = []
+        for call in calls:
+            if over:
+                results[call["id"]] = (
+                    f"Not run: the limit of {limit} tool calls for one message "
+                    "was reached. Answer now with what you have, without "
+                    "calling more tools.", True)
+                continue
+            if call.get("error"):
+                results[call["id"]] = (call["error"] + " Write the call again "
+                                       "correctly.", True)
+                continue
+            tool = self.mcp.find(call["name"]) if self.mcp else None
+            if tool is None or tool_policy(self.cfg, tool) == "never":
+                names = ", ".join(t.key for t in self._offered_tools()) or "none"
+                results[call["id"]] = (f"There is no tool named "
+                                       f"“{call['name']}”. Available: {names}.", True)
+                continue
+            if not self._approve(call, tool):
+                results[call["id"]] = ("I declined to run this tool call. Take "
+                                       "another approach, or ask me.", True)
+                continue
+            if self._tool_round is None or self._tool_round["cancelled"]:
+                return              # stopped while the dialog was open
+            jobs.append((call, tool))
+        self._render_tools()
+
+        if not jobs:
+            self._tools_finished()
+            return
+        timeout = float(self.cfg.get("mcp_tool_timeout_s", 120))
+        self._tool_worker = ToolWorker(self.mcp, jobs, timeout, self)
+        self._tool_worker.result.connect(self._on_tool_result)
+        self._tool_worker.finished.connect(self._on_tools_thread_done)
+        self._tool_worker.start()
+
+    def _approve(self, call: dict, tool) -> bool:
+        """Ask before running, unless the tool is allowed and the arguments
+        do not look destructive."""
+        args = _pretty_args(call.get("arguments"))
+        risky = is_destructive(args)
+        if tool_policy(self.cfg, tool) == "allow" and not risky:
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("Run tool?")
+        box.setIcon(QMessageBox.Warning if risky or tool.destructive
+                    else QMessageBox.Question)
+        desc = " ".join(tool.description.split())
+        if len(desc) > 300:
+            desc = desc[:300] + "…"
+        warn = ("\n\nThese arguments look hard to undo. Read them carefully."
+                if risky else
+                "\n\nThe server says this tool can delete or overwrite data."
+                if tool.destructive else "")
+        box.setText(f"The assistant wants to run “{tool.name}” from the "
+                    f"{tool.server} server.{warn}")
+        box.setInformativeText(f"{desc}\n\nArguments:\n{clip(args, 1500)}"
+                               if desc else f"Arguments:\n{clip(args, 1500)}")
+        run = box.addButton("Run", QMessageBox.AcceptRole)
+        always = None
+        if not risky:
+            always = box.addButton("Always allow this tool", QMessageBox.AcceptRole)
+        no = box.addButton("Don't run", QMessageBox.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        clicked = box.clickedButton()
+        if always is not None and clicked is always:
+            self._set_policy(tool.key, "allow")
+            return True
+        return clicked is run
+
+    def _on_tool_result(self, call_id: str, text: str, is_error: bool):
+        if self._tool_round is None or self._stale(self._tool_worker):
+            return
+        self._tool_round["results"][call_id] = (text, is_error)
+        self._render_tools()
+
+    def _on_tools_thread_done(self):
+        if self._tool_worker is None or self._stale(self._tool_worker):
+            return
+        self._tool_worker = None
+        self._tools_finished()
+
+    def _tools_finished(self):
+        """Every call in the round has a result: record them and go on."""
+        rnd = self._tool_round
+        if rnd is None or rnd["cancelled"]:
+            return
+        for call in rnd["calls"]:
+            if call["id"] not in rnd["results"]:
+                rnd["results"][call["id"]] = ("No result — the tool did not "
+                                              "return.", True)
+        self._record_results(rnd)
+        self._tool_round = None
+        self._tools_busy = False
+        self._render_tools_final(rnd)
+        self._continue(no_tools=rnd["over"])
+
+    def _record_results(self, rnd):
+        for call in rnd["calls"]:
+            text, is_error = rnd["results"][call["id"]]
+            full = text or "(empty)"
+            sent, cut = fit_output(full, self.output_budget)
+            if cut:
+                sent = f"{sent}\n\n{cut}"
+            self.messages.append({
+                "role": "tool", "tool_call_id": call["id"],
+                "name": call["name"], "content": sent, "is_error": is_error,
+                "short": clip(full, 800)})
+            self._run_log.append({
+                "command": f"[tool] {call['name']} "
+                           f"{json.dumps(call.get('arguments') or {}, ensure_ascii=False)}",
+                "result": "failed" if is_error else "ok", "time": time.time()})
+        self.save_chat()
+
+    def _cancel_tools(self):
+        """Stop a round of tool calls. Unfinished calls get a result saying
+        so, because every call in the history must have one."""
+        rnd = self._tool_round
+        if self._tool_worker is not None:
+            self._retire(self._tool_worker)
+            self._tool_worker = None
+        if rnd is None:
+            self._tools_busy = False
+            return
+        rnd["cancelled"] = True
+        self._tool_round = None
+        self._tools_busy = False
+        for call in rnd["calls"]:
+            rnd["results"].setdefault(call["id"], ("Cancelled by me before it "
+                                                   "finished.", True))
+        self._record_results(rnd)
+        self._render_tools_final(rnd)
+
+    def _continue(self, no_tools: bool = False):
+        """Ask the model to carry on after a round of tool results."""
+        self._display.append(("assistant", ""))
+        self.streaming = True
+        self._req_started = time.monotonic()
+        self._answer_started = 0.0
+        self._render(follow=True)
+        self.send_btn.setVisible(False)
+        self.stop_btn.setVisible(True)
+        self._wait_timer.start(1000)
+        if self._agent_turn:
+            last = max(i for i, m in enumerate(self.messages) if m["role"] == "user")
+            api = (self._agent_request(self.messages[last]["content"]) +
+                   [self._api_view(m, False) for m in self.messages[last + 1:]])
+        else:
+            api = self._api_messages()
+        self._start_worker(api, no_tools=no_tools)
+
+    def _tool_text(self, rnd, running: bool) -> str:
+        parts = []
+        for call in rnd["calls"]:
+            res = rnd["results"].get(call["id"])
+            name = call.get("name") or "?"
+            tool = self.mcp.find(name) if self.mcp else None
+            label = f"`{tool.name}` · {tool.server}" if tool else f"`{name}`"
+            if res is None:
+                state = "*running…*" if running else "*waiting*"
+            elif res[1]:
+                state = "**error**"
+            else:
+                state = "done"
+            block = [f"**Tool** {label} — {state}"]
+            args = call.get("arguments")
+            if args:
+                block.append(f"```json\n{clip(_pretty_args(args), 600)}\n```")
+            if res is not None:
+                text = res[0] or "(empty)"
+                shown = (text if len(text) <= self.TOOL_PREVIEW_CHARS
+                         else text[:self.TOOL_PREVIEW_CHARS].rsplit("\n", 1)[0]
+                         + f"\n… ({len(text):,} characters in all)")
+                block.append(f"```\n{shown}\n```")
+            parts.append("\n".join(block))
+        return "\n\n".join(parts)
+
+    TOOL_PREVIEW_CHARS = 1500   # of each tool result, in the transcript
+
+    def _render_tools(self, follow=None):
+        rnd = self._tool_round
+        if rnd is None:
+            return
+        self._display[rnd["index"]] = ("tool", self._tool_text(rnd, True))
+        self._render(follow=follow)
+
+    def _render_tools_final(self, rnd):
+        if rnd["index"] < len(self._display):
+            self._display[rnd["index"]] = ("tool", self._tool_text(rnd, False))
+        self.send_btn.setVisible(True)
+        self.stop_btn.setVisible(False)
+        self._render()
+
+    # Tools menu --------------------------------------------------------
+
+    def _set_policy(self, key: str, policy: str):
+        policies = dict(self.cfg.get("mcp_tool_policy") or {})
+        policies[key] = policy
+        self.cfg["mcp_tool_policy"] = policies
+        try:
+            save_config(self.cfg)
+        except OSError as exc:
+            self.notice.emit(f"Could not save the tool setting: {exc}")
+        self._update_tools_button()
+
+    def _update_tools_button(self):
+        if not hasattr(self, "tools_btn"):
+            return
+        if self.mcp is None or not self.mcp.states():
+            self.tools_btn.setText("Tools")
+            self.tools_btn.setToolTip("No MCP servers. Add them in Settings → "
+                                      "MCP tools.")
+            return
+        n = len(self._offered_tools())
+        failed = any(s.status == "error" for s in self.mcp.states())
+        self.tools_btn.setText(f"Tools ({n})" + (" ⚠" if failed else ""))
+        self.tools_btn.setToolTip(self.mcp.summary())
+
+    def _fill_tools_menu(self):
+        menu = self.tools_menu
+        menu.clear()
+        mode = self.cfg.get("tool_mode", "auto")
+        states = self.mcp.states() if self.mcp else []
+        head = menu.addAction(self.mcp.summary() if states else
+                              "No MCP servers yet")
+        head.setEnabled(False)
+        if states:
+            how = {"auto": "Auto", "native": "Native", "text": "Text protocol",
+                   "off": "Off"}.get(mode, mode)
+            if mode == "auto" and self._model_key() in self._text_only:
+                how += " — using text protocol for this model"
+            menu.addAction(f"Tool calls: {how}").setEnabled(False)
+        menu.addSeparator()
+        labels = {"allow": "Allow — run without asking",
+                  "ask": "Ask each time",
+                  "never": "Never — hide from the assistant"}
+        short = {"allow": "allow", "ask": "ask", "never": "never"}
+        for st in states:
+            status = {"ready": f"{len(st.tools)} tools", "error": "failed",
+                      "connecting": "connecting…", "disabled": "disabled",
+                      "off": "stopped"}.get(st.status, st.status)
+            sub = menu.addMenu(f"{st.name}  ({status})")
+            if st.error:
+                err = sub.addAction(clip(st.error, 200))
+                err.setEnabled(False)
+            for tool in st.tools:
+                current = tool_policy(self.cfg, tool)
+                tmenu = sub.addMenu(f"{tool.name}   [{short[current]}]")
+                if tool.description:
+                    d = tmenu.addAction(clip(" ".join(tool.description.split()), 160))
+                    d.setEnabled(False)
+                    tmenu.addSeparator()
+                group = QActionGroup(tmenu)
+                group.setExclusive(True)
+                for key, label in labels.items():
+                    act = tmenu.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(key == current)
+                    group.addAction(act)
+                    act.triggered.connect(
+                        lambda _=False, k=tool.key, p=key: self._set_policy(k, p))
+        if states:
+            menu.addSeparator()
+            menu.addAction("Reconnect servers").triggered.connect(self._reconnect)
+        menu.addAction("MCP settings…").triggered.connect(self.open_settings.emit)
+
+    def _reconnect(self):
+        if self.mcp is not None:
+            self.mcp.reconnect()
+            self.notice.emit("Reconnecting MCP servers…")
 
     def _run_selected(self):
         if self._auto_timer.isActive():

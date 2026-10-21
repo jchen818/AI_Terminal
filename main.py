@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from chat import ChatPanel
 from config import ask_settings, load_config, window_size
+from mcp_client import MCPManager
 from terminal import TerminalWidget
 
 DARK_QSS = """
@@ -80,8 +81,12 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(term_header)
         left_layout.addWidget(self.terminal, 1)
 
+        # ---- MCP servers: connect in the background ---------------------
+        self.mcp = MCPManager(self)
+        self.mcp.configure(self.cfg.get("mcp_servers", {}))
+
         # ---- right: chat ---------------------------------------------
-        self.chat = ChatPanel(self.cfg, self.terminal)
+        self.chat = ChatPanel(self.cfg, self.terminal, self.mcp)
         self.chat.open_settings.connect(self.edit_settings)
         self.chat.run_in_terminal.connect(self.terminal.run_command)
         self.terminal.command_output.connect(self.chat.on_command_output)
@@ -167,6 +172,8 @@ class MainWindow(QMainWindow):
                         or new.get("font_size") != self.cfg.get("font_size"))
         size_changed = new.get("window_size") != self.cfg.get("window_size")
         self.cfg = new
+        # Only servers whose entry changed are restarted.
+        self.mcp.configure(new.get("mcp_servers", {}))
         self.chat.refresh_config(new)
         self.terminal.cfg = new
         if shell_changed:
@@ -207,6 +214,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.chat.save_chat()
         self.chat.stop()
+        self.mcp.shutdown()
         self.terminal.close_session()
         super().closeEvent(event)
 

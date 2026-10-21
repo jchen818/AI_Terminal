@@ -11,7 +11,8 @@ prompt.
 
 ## Install
 
-Requires Windows 10 1809 or later (ConPTY) and Python 3.9+.
+Requires Windows 10 1809 or later (ConPTY) and Python 3.10+ (3.9 runs, without
+MCP tools).
 
 ```
 pip install -r requirements.txt
@@ -81,6 +82,59 @@ carries more, a note says so and the rest stay selectable in the dropdown.
 
 A command counts as finished once the shell has been quiet for 900 ms; adjust
 `capture_idle_ms` in `config.json` if commands on a slow link get cut short.
+
+## MCP tools
+
+Besides running commands in the terminal, the assistant can call tools from
+[MCP](https://modelcontextprotocol.io) servers: a filesystem, Git, a database,
+your own scripts. Add servers in **Settings → MCP tools** in the same JSON shape
+Claude Desktop uses, so its `mcpServers` section can be pasted in as is:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/work"]
+    },
+    "remote": { "url": "http://10.0.0.5:8000/mcp",
+                "headers": { "Authorization": "Bearer ..." } },
+    "legacy": { "url": "http://10.0.0.6:9000/sse", "type": "sse" },
+    "parked": { "command": "uvx", "args": ["some-server"], "disabled": true }
+  }
+}
+```
+
+Local servers start as child processes; their stderr goes to
+`%APPDATA%\AITerminal\mcp-<name>.log`. Remote servers use Streamable HTTP, or SSE
+with `"type": "sse"`. Servers connect in the background when the app starts and
+when you save settings; only entries that changed are restarted.
+
+**How the model calls tools** — *Tool calls* in settings:
+
+| Setting | What happens |
+| --- | --- |
+| Auto (default) | Tools are sent natively. If the server refuses them, the app switches to the text protocol for that model for the rest of the session. |
+| Native only | The `tools` field of the API. Needs a model trained for tool use and a server that parses its calls. |
+| Text protocol only | The tools are described in the system prompt and the model writes a ` ```tool ` block holding `{"name": …, "arguments": {…}}`. Works with any model that follows instructions. The reply is cut off at the end of the block, so the model cannot invent the result. |
+| Off | No tools are offered. |
+
+vLLM only accepts native tool calls when started with
+`--enable-auto-tool-choice --tool-call-parser <parser>` (`hermes` for Qwen,
+`llama3_json` for Llama 3.x, and so on). Without those flags Auto falls back to the
+text protocol on the first request.
+
+**Permissions** — the **Tools** button above the chat lists each server and tool.
+Every tool is *Allow* (runs without asking), *Ask each time*, or *Never* (hidden
+from the model). Tools their server marks read-only start as Allow; the rest
+start as Ask, and the confirmation offers *Always allow this tool*. Arguments that
+match the destructive-command list (the same one auto-run uses) always ask, even
+for allowed tools.
+
+Each tool call and its result appear in the transcript. The model may make up to
+*Calls per message* rounds of calls (10 by default) before it must answer; Stop
+cancels a round, and calls that did not finish are reported to the model as
+cancelled. Tool calls are listed in the memory digest with the commands run.
 
 ## Scrolling
 
@@ -152,7 +206,10 @@ pasted text runs a command the moment it arrives. Turn that off under
 main.py        window, splitter, menus
 terminal.py    ConPTY session + pyte emulator + custom painting
 chat.py        transcript, composer, code-block runner
-ai_client.py   streaming clients for OpenAI / Anthropic / Ollama wire formats
+ai_client.py   streaming clients for OpenAI / Anthropic / Ollama wire formats,
+               native and text-protocol tool calls
+mcp_client.py  MCP server connections on a background asyncio thread
+memory.py      saved chats and the memory digest
 config.py      config file and settings dialog
 ```
 
